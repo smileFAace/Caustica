@@ -43,16 +43,18 @@ public final class RtTerrain {
 
     private final RtBuffer positions;
     private final RtBuffer indices;
-    private final RtBuffer material; // per-primitive: {vec4 normal, vec4 albedo}
+    private final RtBuffer uvs;      // per-vertex: vec2 atlas UV
+    private final RtBuffer material; // per-primitive: {vec4 normal, vec4 tint}
     private final RtAccel blas;
     private final RtAccel tlas;
     public final int blockX;
     public final int blockY;
     public final int blockZ;
 
-    private RtTerrain(RtBuffer positions, RtBuffer indices, RtBuffer material, RtAccel blas, RtAccel tlas, int bx, int by, int bz) {
+    private RtTerrain(RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material, RtAccel blas, RtAccel tlas, int bx, int by, int bz) {
         this.positions = positions;
         this.indices = indices;
+        this.uvs = uvs;
         this.material = material;
         this.blas = blas;
         this.tlas = tlas;
@@ -69,9 +71,19 @@ public final class RtTerrain {
         return tlas.handle;
     }
 
-    /** Device address of the per-primitive material buffer ({vec4 normal, vec4 albedo} per triangle). */
+    /** Device address of the per-primitive material buffer ({vec4 normal, vec4 tint} per triangle). */
     public long primAddress() {
         return material.deviceAddress;
+    }
+
+    /** Device address of the index buffer (uint per index) — for per-vertex UV lookup in the hit shader. */
+    public long indexAddress() {
+        return indices.deviceAddress;
+    }
+
+    /** Device address of the per-vertex UV buffer (vec2 atlas UV per vertex). */
+    public long uvAddress() {
+        return uvs.deviceAddress;
     }
 
     public static boolean extractAroundPlayer(RtContext ctx) {
@@ -126,12 +138,14 @@ public final class RtTerrain {
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         RtBuffer positions = ctx.createBuffer((long) capture.verts.size() * Float.BYTES, asInput, true);
-        RtBuffer indices = ctx.createBuffer((long) capture.idx.size() * Integer.BYTES, asInput, true);
-        RtBuffer material = ctx.createBuffer((long) capture.prim.size() * Float.BYTES,
-                org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+        RtBuffer indices = ctx.createBuffer((long) capture.idx.size() * Integer.BYTES, asInput | storage, true);
+        RtBuffer uvs = ctx.createBuffer((long) capture.uvList.size() * Float.BYTES, storage, true);
+        RtBuffer material = ctx.createBuffer((long) capture.prim.size() * Float.BYTES, storage, true);
         MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
         MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
+        MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
         MemoryUtil.memFloatBuffer(material.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
 
         RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, vertCount, indices, idxCount);
@@ -141,7 +155,7 @@ public final class RtTerrain {
         if (instance != null) {
             instance.destroy();
         }
-        instance = new RtTerrain(positions, indices, material, blas, tlas, cx, cy, cz);
+        instance = new RtTerrain(positions, indices, uvs, material, blas, tlas, cx, cy, cz);
         UpscalerMod.LOGGER.info("RT terrain: {} blocks -> {} triangles ({} verts) around ({},{},{}); BLAS+TLAS built",
                 blocks, idxCount / 3, vertCount, cx, cy, cz);
         return true;
@@ -151,6 +165,7 @@ public final class RtTerrain {
         tlas.destroy();
         blas.destroy();
         material.destroy();
+        uvs.destroy();
         indices.destroy();
         positions.destroy();
         if (instance == this) {
@@ -162,7 +177,8 @@ public final class RtTerrain {
     private static final class QuadCapture implements BlockQuadOutput {
         final FloatArrayList verts = new FloatArrayList();
         final IntArrayList idx = new IntArrayList();
-        final FloatArrayList prim = new FloatArrayList(); // 8 floats/triangle: normal.xyz0, albedo.rgb0
+        final FloatArrayList uvList = new FloatArrayList(); // 2 floats/vertex: atlas UV
+        final FloatArrayList prim = new FloatArrayList(); // 8 floats/triangle: normal.xyz0, tint.rgb0
 
         @Override
         public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
@@ -175,6 +191,10 @@ public final class RtTerrain {
             addVertex(p1, x, y, z);
             addVertex(p2, x, y, z);
             addVertex(p3, x, y, z);
+            addUv(quad.packedUV(0));
+            addUv(quad.packedUV(1));
+            addUv(quad.packedUV(2));
+            addUv(quad.packedUV(3));
             idx.add(base);
             idx.add(base + 1);
             idx.add(base + 2);
@@ -209,6 +229,12 @@ public final class RtTerrain {
             verts.add(p.x() + x);
             verts.add(p.y() + y);
             verts.add(p.z() + z);
+        }
+
+        private void addUv(long packedUV) {
+            // UVPair packs u in the high 32 bits, v in the low 32 (atlas-space, no sprite remap needed).
+            uvList.add(Float.intBitsToFloat((int) (packedUV >>> 32)));
+            uvList.add(Float.intBitsToFloat((int) packedUV));
         }
     }
 

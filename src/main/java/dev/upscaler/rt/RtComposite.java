@@ -2,19 +2,25 @@ package dev.upscaler.rt;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.GpuTexture;
+import com.mojang.blaze3d.textures.GpuTextureView;
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import com.mojang.blaze3d.vulkan.VulkanGpuTexture;
+import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.client.SodiumCompat;
 import dev.upscaler.mixin.CommandEncoderAccessor;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.texture.TextureAtlas;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkImageCopy;
+import org.lwjgl.vulkan.VkSamplerCreateInfo;
 
 import java.nio.ByteBuffer;
+import java.nio.LongBuffer;
 
 /**
  * On-screen composite. Each frame, ray-trace into a screen-sized storage image, blend it 50/50
@@ -31,7 +37,7 @@ public final class RtComposite {
     /** Blend weight of RT over vanilla: 0 = vanilla only, 1 = RT only. {@code -Dupscaler.rt.blend}. */
     public static final float BLEND = parseBlend();
 
-    private static final int WORLD_PUSH_SIZE = 88; // mat4 invViewProj (64) + vec3 camOffset (@64) + uint64 normalAddr (@80)
+    private static final int WORLD_PUSH_SIZE = 104; // invViewProj(64) + camOffset(@64) + primAddr(@80) + idxAddr(@88) + uvAddr(@96)
 
     private static float parseBlend() {
         try {
@@ -48,6 +54,7 @@ public final class RtComposite {
     private RtImage baseCopy;
     private long boundTriangleTlas;
     private long boundWorldTlas;
+    private long atlasSampler;
     private boolean failed;
     private boolean loggedActive;
 
@@ -106,10 +113,11 @@ public final class RtComposite {
 
     private RtPipeline ensureWorld(RtContext ctx) {
         if (worldPipeline == null) {
-            worldPipeline = RtPipeline.create(ctx, "world.rgen.spv", "world.rmiss.spv", "world.rchit.spv", WORLD_PUSH_SIZE);
+            worldPipeline = RtPipeline.create(ctx, "world.rgen.spv", "world.rmiss.spv", "world.rchit.spv", WORLD_PUSH_SIZE, true);
             if (output != null) {
                 worldPipeline.setStorageImage(output.view);
             }
+            worldPipeline.setAtlasSampler(blockAtlasView(), atlasSampler(ctx));
         }
         long tlas = RtTerrain.currentOrNull().tlas();
         if (boundWorldTlas != tlas) {
@@ -170,6 +178,8 @@ public final class RtComposite {
                 push.putFloat(68, (float) (camY - terrain.blockY));
                 push.putFloat(72, (float) (camZ - terrain.blockZ));
                 push.putLong(80, terrain.primAddress());
+                push.putLong(88, terrain.indexAddress());
+                push.putLong(96, terrain.uvAddress());
                 active.trace(cmd, width, height, push);
             } else {
                 active.trace(cmd, width, height);
@@ -214,8 +224,52 @@ public final class RtComposite {
             trianglePipeline.destroy();
             trianglePipeline = null;
         }
+        if (atlasSampler != 0L) {
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx != null) {
+                VK10.vkDestroySampler(ctx.vk(), atlasSampler, null);
+            }
+            atlasSampler = 0L;
+        }
         boundTriangleTlas = 0L;
         boundWorldTlas = 0L;
+    }
+
+    private long atlasSampler(RtContext ctx) {
+        if (atlasSampler == 0L) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
+                        .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
+                        .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_NEAREST)
+                        .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                        .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                        .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                        .minLod(0f).maxLod(0f);
+                LongBuffer p = stack.mallocLong(1);
+                if (VK10.vkCreateSampler(ctx.vk(), sci, null, p) != VK10.VK_SUCCESS) {
+                    throw new IllegalStateException("vkCreateSampler(block atlas) failed");
+                }
+                atlasSampler = p.get(0);
+            }
+        }
+        return atlasSampler;
+    }
+
+    private static long blockAtlasView() {
+        GpuTextureView view = Minecraft.getInstance().getTextureManager()
+                .getTexture(TextureAtlas.LOCATION_BLOCKS).getTextureView();
+        return vkImageView(view);
+    }
+
+    private static long vkImageView(GpuTextureView view) {
+        Long sodiumHandle = SodiumCompat.vkImageView(view);
+        if (sodiumHandle != null) {
+            return sodiumHandle;
+        }
+        if (view instanceof VulkanGpuTextureView vulkanView) {
+            return vulkanView.vkImageView();
+        }
+        throw new IllegalStateException("cannot resolve VkImageView for " + view);
     }
 
     private static long vkImage(GpuTexture texture) {
