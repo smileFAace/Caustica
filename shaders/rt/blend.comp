@@ -1,0 +1,18 @@
+#version 460
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(binding = 0, set = 0, rgba8) uniform image2D baseImage;
+layout(binding = 1, set = 0, rgba8) uniform readonly image2D rtImage;
+
+void main() {
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(baseImage);
+    if (pix.x >= size.x || pix.y >= size.y) {
+        return;
+    }
+
+    vec4 base = imageLoad(baseImage, pix);
+    vec4 rt = imageLoad(rtImage, pix);
+    imageStore(baseImage, pix, mix(base, rt, 0.5));
+}

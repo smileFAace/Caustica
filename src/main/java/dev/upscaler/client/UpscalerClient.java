@@ -4,8 +4,10 @@ import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtContext;
 import dev.upscaler.rt.RtDeviceBringup;
 import dev.upscaler.rt.RtSelfTest;
+import dev.upscaler.rt.RtComposite;
 import dev.upscaler.rt.RtTriangleScene;
 import net.fabricmc.api.ClientModInitializer;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 
 public final class UpscalerClient implements ClientModInitializer {
@@ -34,6 +36,25 @@ public final class UpscalerClient implements ClientModInitializer {
 					}
 					rtInitDone = true;
 				}
+			}
+		});
+
+		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+			DlssPipeline.INSTANCE.destroy();
+			FsrPipeline.INSTANCE.destroy();
+			WorldRenderScaler.INSTANCE.destroy();
+
+			RtContext ctx = RtContext.currentOrNull();
+			if (ctx != null) {
+				ctx.waitIdle();
+			}
+			RtComposite.INSTANCE.destroy();
+			RtTriangleScene scene = RtTriangleScene.currentOrNull();
+			if (scene != null) {
+				scene.destroy();
+			}
+			if (ctx != null) {
+				ctx.destroy();
 			}
 		});
 	}

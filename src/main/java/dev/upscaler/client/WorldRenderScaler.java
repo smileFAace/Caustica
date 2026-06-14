@@ -137,12 +137,6 @@ public final class WorldRenderScaler {
 		this.savedDepth = null;
 		this.savedDepthView = null;
 
-		// P0 RT composite: when on, ray trace over the world target and skip the upscaler
-		// (RT replaces rasterization rather than upscaling it).
-		if (RtComposite.ENABLED && RtComposite.INSTANCE.composite(mainTarget.getColorTexture(), this.savedWidth, this.savedHeight)) {
-			return;
-		}
-
 		// Preferred path: temporal upscale low-res color/depth -> native color.
 		// The seam sits before the pre-hand depth clear, so lowResDepth holds pure
 		// world depth here — no snapshot needed.
@@ -159,6 +153,7 @@ public final class WorldRenderScaler {
 					mainTarget.getColorTexture(), this.savedWidth, this.savedHeight);
 		}
 		if (temporalDone) {
+			compositeRt(mainTarget);
 			return;
 		}
 
@@ -176,6 +171,13 @@ public final class WorldRenderScaler {
 					RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
 			pass.draw(3, 1, 0, 0);
 		}
+		compositeRt(mainTarget);
+	}
+
+	private void compositeRt(RenderTarget mainTarget) {
+		if (RtComposite.ENABLED) {
+			RtComposite.INSTANCE.composite(mainTarget.getColorTexture(), this.savedWidth, this.savedHeight);
+		}
 	}
 
 	private void ensureLowResTargets(int width, int height) {
@@ -192,6 +194,15 @@ public final class WorldRenderScaler {
 		this.lowResDepthView = device.createTextureView(this.lowResDepth);
 		this.lowResWidth = width;
 		this.lowResHeight = height;
+	}
+
+	public void destroy() {
+		destroyLowResTargets();
+		this.savedColor = null;
+		this.savedColorView = null;
+		this.savedDepth = null;
+		this.savedDepthView = null;
+		this.active = false;
 	}
 
 	private void destroyLowResTargets() {

@@ -22,7 +22,6 @@ public final class SodiumCompat {
 	private static final List<String> NGX_DEVICE_EXTENSIONS = List.of(
 			"VK_NVX_binary_import",
 			"VK_NVX_image_view_handle",
-			"VK_EXT_buffer_device_address",
 			"VK_KHR_push_descriptor");
 	private static final List<String> NGX_INSTANCE_EXTENSIONS = List.of(
 			"VK_KHR_get_physical_device_properties2");

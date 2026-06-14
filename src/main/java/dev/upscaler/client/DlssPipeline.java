@@ -90,6 +90,7 @@ public final class DlssPipeline {
 
 	private boolean failed;
 	private boolean initialized;
+	private boolean ngxInitialized;
 	private boolean loggedActive;
 	private boolean loggedMissingNvngx;
 
@@ -187,7 +188,7 @@ public final class DlssPipeline {
 			return true;
 		} catch (Throwable t) {
 			try {
-				destroyFrameResources(device);
+				destroy(device);
 			} catch (Throwable cleanupError) {
 				t.addSuppressed(cleanupError);
 			}
@@ -235,6 +236,7 @@ public final class DlssPipeline {
 				throw new IllegalStateException("ngxshim_init failed: 0x" + Integer.toHexString(rc)
 						+ " last=0x" + Integer.toHexString(this.lib.lastResult()));
 			}
+			this.ngxInitialized = true;
 			if (!this.lib.dlssAvailable()) {
 				throw new IllegalStateException("DLSS is not available on this system");
 			}
@@ -411,6 +413,22 @@ public final class DlssPipeline {
 			throw new IllegalStateException("vkEndCommandBuffer(DLSS) failed: " + endResult);
 		}
 		encoder.execute(cmd);
+	}
+
+	public void destroy() {
+		if (((GpuDeviceAccessor) RenderSystem.getDevice()).upscaler$getBackend() instanceof VulkanDevice device) {
+			destroy(device);
+		}
+	}
+
+	private void destroy(VulkanDevice device) {
+		destroyFrameResources(device);
+		if (this.lib != null && this.ngxInitialized) {
+			this.lib.shutdown(device.vkDevice().address());
+			this.ngxInitialized = false;
+		}
+		this.initialized = false;
+		this.lib = null;
 	}
 
 	private void destroyFrameResources(VulkanDevice device) {

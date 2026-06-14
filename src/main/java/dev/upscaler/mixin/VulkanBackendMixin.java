@@ -6,10 +6,16 @@ import com.mojang.blaze3d.shaders.ShaderSource;
 import com.mojang.blaze3d.systems.GpuDevice;
 import com.mojang.blaze3d.vulkan.VulkanBackend;
 import com.mojang.blaze3d.vulkan.VulkanPhysicalDevice;
+import com.mojang.blaze3d.vulkan.init.VulkanFeature;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtDeviceBringup;
 import net.fabricmc.loader.api.FabricLoader;
+import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
+import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
+import org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -19,7 +25,9 @@ import org.spongepowered.asm.mixin.injection.invoke.arg.Args;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Standalone fallback for the Vulkan device-negotiation hook: adds the device
@@ -42,6 +50,14 @@ import java.util.List;
  */
 @Mixin(VulkanBackend.class)
 public abstract class VulkanBackendMixin {
+	private static final VulkanFeature STORAGE_IMAGE_WRITE_WITHOUT_FORMAT =
+			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat",
+					VkPhysicalDeviceFeatures.SHADERSTORAGEIMAGEWRITEWITHOUTFORMAT);
+	private static final List<VulkanFeature> SDK_SHADER_FEATURES = List.of(
+			STORAGE_IMAGE_WRITE_WITHOUT_FORMAT,
+			new VulkanFeature(VulkanBackend.VK10_FEATURES_STRUCT, "shaderInt16", VkPhysicalDeviceFeatures.SHADERINT16),
+			new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16));
+
 	private static final List<String> UPSCALER_WANTED_EXTENSIONS = List.of(
 			// FFX (FSR)
 			"VK_KHR_get_memory_requirements2",
@@ -51,11 +67,11 @@ public abstract class VulkanBackendMixin {
 			// without Sodium, DLSS relies on it being core/enabled at instance level.)
 			"VK_NVX_binary_import",
 			"VK_NVX_image_view_handle",
-			"VK_EXT_buffer_device_address",
 			"VK_KHR_push_descriptor");
 
 	private static final boolean SODIUM_OWNS_NEGOTIATION =
 			FabricLoader.getInstance().isModLoaded("sodium");
+	private static final Set<String> loggedMissingSdkFeatures = new HashSet<>();
 
 	@ModifyArgs(
 			method = "createDevice(JLcom/mojang/blaze3d/shaders/ShaderSource;Lcom/mojang/blaze3d/shaders/GpuDebugOptions;Ljava/lang/Runnable;)Lcom/mojang/blaze3d/systems/GpuDevice;",
@@ -83,10 +99,44 @@ public abstract class VulkanBackendMixin {
 			args.set(0, augmented);
 		}
 
+		upscaler$addCoreDeviceFeatures(args, physicalDevice);
+
 		// P0 — RT feature structs go in arg2, which Sodium never touches. Names are
 		// guaranteed in arg0 when standalone, or when Sodium accepted our registration.
 		if (!SODIUM_OWNS_NEGOTIATION || RtDeviceBringup.sodiumExtensionsRegistered) {
 			RtDeviceBringup.addFeatures(args, physicalDevice);
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private void upscaler$addCoreDeviceFeatures(Args args, VulkanPhysicalDevice physicalDevice) {
+		Set<VulkanFeature> features = new HashSet<>((Set<VulkanFeature>) args.get(2));
+		boolean changed = false;
+		for (VulkanFeature feature : SDK_SHADER_FEATURES) {
+			if (!upscaler$supportsFeature(physicalDevice, feature)) {
+				if (loggedMissingSdkFeatures.add(feature.name())) {
+					UpscalerMod.LOGGER.warn("Device [{}] lacks {}; FSR/DLSS SDK shaders may fail validation",
+							physicalDevice.deviceName(), feature.name());
+				}
+				continue;
+			}
+
+			if (features.add(feature)) {
+				changed = true;
+				UpscalerMod.LOGGER.info("Enabling Vulkan feature {} for FSR/DLSS SDK shaders", feature.name());
+			}
+		}
+		if (changed) {
+			args.set(2, features);
+		}
+	}
+
+	private static boolean upscaler$supportsFeature(VulkanPhysicalDevice physicalDevice, VulkanFeature feature) {
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			VkPhysicalDeviceFeatures2 deviceFeatures = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default();
+			feature.struct().findOrCreateStructInPNextChain(deviceFeatures, stack);
+			VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), deviceFeatures);
+			return feature.get(deviceFeatures);
 		}
 	}
 

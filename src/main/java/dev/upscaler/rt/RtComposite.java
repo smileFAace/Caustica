@@ -14,19 +14,19 @@ import org.lwjgl.vulkan.VkImageCopy;
 
 /**
  * P0 on-screen composite: each frame, ray-trace the triangle TLAS into a screen-sized storage
- * image and {@code vkCmdCopyImage} it over the world color target at the end-of-world seam,
- * recorded into the frame's command stream (deferred submit is correct for per-frame work).
- * Gated by {@code -Dupscaler.rt.composite=true}; when on, RT is the sole writer of the world
- * target and the upscaler path is skipped.
+ * image, blend it 50/50 with the upscaled world color, and copy the blended result back to the
+ * world target at the end-of-world seam. Gated by {@code -Dupscaler.rt.composite=true}.
  *
- * <p>Pipeline/SBT/descriptor are built once; the output image is rebuilt on resize.
+ * <p>Pipeline/SBT/descriptor are built once; screen-sized images are rebuilt on resize.
  */
 public final class RtComposite {
     public static final RtComposite INSTANCE = new RtComposite();
     public static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("upscaler.rt.composite", "false"));
 
     private RtPipeline pipeline;
+    private RtBlendPipeline blendPipeline;
     private RtImage output;
+    private RtImage baseCopy;
     private long boundTlas;
     private boolean failed;
     private boolean loggedActive;
@@ -53,7 +53,7 @@ public final class RtComposite {
             recordFrame(nativeColor, width, height);
             if (!loggedActive) {
                 loggedActive = true;
-                UpscalerMod.LOGGER.info("RT composite active: tracing {}x{} into the world target", width, height);
+                UpscalerMod.LOGGER.info("RT composite active: tracing {}x{} and blending over the world target at 50%", width, height);
             }
             return true;
         } catch (Throwable t) {
@@ -67,6 +67,9 @@ public final class RtComposite {
         if (pipeline == null) {
             pipeline = RtPipeline.create(ctx, "triangle.rgen.spv", "triangle.rmiss.spv", "triangle.rchit.spv");
         }
+        if (blendPipeline == null) {
+            blendPipeline = RtBlendPipeline.create(ctx);
+        }
         if (boundTlas != tlas) {
             pipeline.setTlas(tlas);
             boundTlas = tlas;
@@ -74,15 +77,21 @@ public final class RtComposite {
     }
 
     private void ensureOutput(RtContext ctx, int width, int height) {
-        if (output != null && output.width == width && output.height == height) {
+        if (output != null && baseCopy != null && output.width == width && output.height == height
+                && baseCopy.width == width && baseCopy.height == height) {
             return;
         }
         ctx.waitIdle(); // resize is rare; no in-flight frame may use the old image/descriptor
+        if (baseCopy != null) {
+            baseCopy.destroy();
+        }
         if (output != null) {
             output.destroy();
         }
         output = ctx.createStorageImage(width, height);
+        baseCopy = ctx.createStorageImage(width, height);
         pipeline.setStorageImage(output.view);
+        blendPipeline.setImages(baseCopy.view, output.view);
     }
 
     private void recordFrame(GpuTexture nativeColor, int width, int height) {
@@ -92,11 +101,16 @@ public final class RtComposite {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             pipeline.trace(cmd, width, height);
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
-            VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
-            region.get(0).srcSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
-            region.get(0).dstSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
-            region.get(0).extent().set(width, height, 1);
-            VK10.vkCmdCopyImage(cmd, output.image, VK10.VK_IMAGE_LAYOUT_GENERAL, dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL, region);
+
+            VK10.vkCmdCopyImage(cmd, dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                    baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, width, height));
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+
+            blendPipeline.dispatch(cmd, width, height);
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+
+            VK10.vkCmdCopyImage(cmd, baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                    dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, width, height));
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
         }
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
@@ -106,9 +120,17 @@ public final class RtComposite {
     }
 
     public void destroy() {
+        if (baseCopy != null) {
+            baseCopy.destroy();
+            baseCopy = null;
+        }
         if (output != null) {
             output.destroy();
             output = null;
+        }
+        if (blendPipeline != null) {
+            blendPipeline.destroy();
+            blendPipeline = null;
         }
         if (pipeline != null) {
             pipeline.destroy();
@@ -126,5 +148,13 @@ public final class RtComposite {
             return vulkanTexture.vkImage();
         }
         throw new IllegalStateException("cannot resolve VkImage for " + texture);
+    }
+
+    private static VkImageCopy.Buffer copyRegion(MemoryStack stack, int width, int height) {
+        VkImageCopy.Buffer region = VkImageCopy.calloc(1, stack);
+        region.get(0).srcSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+        region.get(0).dstSubresource().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1);
+        region.get(0).extent().set(width, height, 1);
+        return region;
     }
 }

@@ -458,6 +458,12 @@ public final class FsrPipeline {
 		return ((VulkanGpuTextureAccessor) texture).upscaler$getVkImage();
 	}
 
+	public void destroy() {
+		if (((GpuDeviceAccessor) RenderSystem.getDevice()).upscaler$getBackend() instanceof VulkanDevice device) {
+			destroyResources(device);
+		}
+	}
+
 	private void destroyResources(VulkanDevice device) {
 		boolean hadAny = this.context != null || this.outputImage != 0 || this.mvTexture != null;
 		if (!hadAny) {

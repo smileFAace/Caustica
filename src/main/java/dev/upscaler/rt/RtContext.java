@@ -150,7 +150,7 @@ public final class RtContext {
         }
     }
 
-    /** Create an R8G8B8A8 storage image (STORAGE + TRANSFER_SRC) already transitioned to GENERAL. */
+    /** Create an R8G8B8A8 storage image (STORAGE + TRANSFER_SRC/DST) already transitioned to GENERAL. */
     public RtImage createStorageImage(int width, int height) {
         long image;
         long allocation;
@@ -159,7 +159,7 @@ public final class RtContext {
             VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
                     .imageType(VK10.VK_IMAGE_TYPE_2D).format(VK10.VK_FORMAT_R8G8B8A8_UNORM)
                     .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
-                    .usage(VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                    .usage(VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT)
                     .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
             ici.extent().set(width, height, 1);
             VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
@@ -181,7 +181,8 @@ public final class RtContext {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
                 b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_SHADER_WRITE_BIT)
+                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT
+                                | VK10.VK_ACCESS_TRANSFER_READ_BIT | VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
                         .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
                         .image(imageFinal);
                 b.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
