@@ -5,6 +5,8 @@ import dev.upscaler.UpscalerMod;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.color.block.BlockColors;
+import net.minecraft.client.color.block.BlockTintSource;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.BlockQuadOutput;
@@ -105,6 +107,8 @@ public final class RtTerrain {
         BlockAndTintGetter view = new LevelView(level);
 
         QuadCapture capture = new QuadCapture();
+        capture.blockColors = mc.getBlockColors();
+        capture.view = view;
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
         int blocks = 0;
 
@@ -121,6 +125,8 @@ public final class RtTerrain {
                         continue;
                     }
                     try {
+                        capture.state = state;
+                        capture.pos = m;
                         renderer.tesselateBlock(capture, dx, dy, dz, view, m, state, model, state.getSeed(m));
                         blocks++;
                     } catch (Throwable t) {
@@ -148,7 +154,8 @@ public final class RtTerrain {
         MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
         MemoryUtil.memFloatBuffer(material.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
 
-        RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, vertCount, indices, idxCount);
+        // Cutout geometry: non-opaque so the any-hit shader alpha-tests the atlas (foliage/glass).
+        RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false);
         float[] identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         RtAccel tlas = RtAccel.buildTlas(ctx, List.of(new RtAccel.Instance(identity, blas.deviceAddress)));
 
@@ -179,6 +186,14 @@ public final class RtTerrain {
         final IntArrayList idx = new IntArrayList();
         final FloatArrayList uvList = new FloatArrayList(); // 2 floats/vertex: atlas UV
         final FloatArrayList prim = new FloatArrayList(); // 8 floats/triangle: normal.xyz0, tint.rgb0
+
+        // Per-block context for biome tint, set before each tesselateBlock call. We resolve the tint
+        // straight from BlockColors (pure biome color) rather than QuadInstance.getColor, which bakes
+        // in vanilla AO + directional shading we don't want — our tint must be unlit albedo.
+        BlockColors blockColors;
+        BlockAndTintGetter view;
+        BlockState state;
+        BlockPos pos;
 
         @Override
         public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
@@ -213,14 +228,29 @@ public final class RtTerrain {
                 ny /= len;
                 nz /= len;
             }
-            for (int t = 0; t < 2; t++) { // one {normal, albedo} record per triangle
+            // Biome tint: tintIndex >= 0 means the quad is biome-colored (grass/foliage/etc.). In 26.2
+            // the color comes from a BlockTintSource; colorInWorld blends the biome color at this pos
+            // (0x00RRGGBB). Untinted quads (tintIndex < 0) stay white.
+            int tintIndex = quad.materialInfo().tintIndex();
+            float tr = 1f, tg = 1f, tb = 1f;
+            if (tintIndex >= 0 && blockColors != null && state != null) {
+                BlockTintSource src = blockColors.getTintSource(state, tintIndex);
+                if (src != null) {
+                    int rgb = src.colorInWorld(state, view, pos);
+                    tr = ((rgb >> 16) & 0xFF) * (1f / 255f);
+                    tg = ((rgb >> 8) & 0xFF) * (1f / 255f);
+                    tb = (rgb & 0xFF) * (1f / 255f);
+                }
+            }
+
+            for (int t = 0; t < 2; t++) { // one {normal, tint} record per triangle
                 prim.add(nx);
                 prim.add(ny);
                 prim.add(nz);
                 prim.add(0f);
-                prim.add(1f);
-                prim.add(1f);
-                prim.add(1f);
+                prim.add(tr);
+                prim.add(tg);
+                prim.add(tb);
                 prim.add(0f);
             }
         }

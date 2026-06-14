@@ -113,7 +113,9 @@ public final class RtComposite {
 
     private RtPipeline ensureWorld(RtContext ctx) {
         if (worldPipeline == null) {
-            worldPipeline = RtPipeline.create(ctx, "world.rgen.spv", "world.rmiss.spv", "world.rchit.spv", WORLD_PUSH_SIZE, true);
+            worldPipeline = RtPipeline.create(ctx, "world.rgen.spv",
+                    new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
+                    WORLD_PUSH_SIZE, true);
             if (output != null) {
                 worldPipeline.setStorageImage(output.view);
             }

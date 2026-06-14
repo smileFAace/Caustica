@@ -3,9 +3,11 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// P1 step 4b: textured terrain. Per-primitive {normal, tint} (gl_PrimitiveID) + per-vertex atlas
-// UVs (index buffer -> UV buffer, barycentric-interpolated) -> sample the block atlas. textureLod 0
-// since rays have no derivatives (ray-cone LOD is a later optimization). Sun + ambient lighting.
+// P1 closest-hit. Resolves block albedo (atlas * tint) and the geometric normal, then writes them
+// plus the hit distance into the payload. Lighting is done in raygen (deferred), so this shader does
+// no shading or secondary tracing. Per-primitive {normal, tint} (gl_PrimitiveID) + per-vertex atlas
+// UVs (index buffer -> UV buffer, barycentric-interpolated). textureLod 0 since rays have no
+// derivatives (ray-cone LOD is a later optimization).
 struct Prim {
     vec4 normal;
     vec4 tint;
@@ -25,7 +27,12 @@ layout(push_constant) uniform Push {
     uint64_t uvAddr;
 } pc;
 
-layout(location = 0) rayPayloadInEXT vec3 payload;
+struct Payload {
+    vec3 albedo;
+    vec3 normal;
+    float hitT;
+};
+layout(location = 0) rayPayloadInEXT Payload payload;
 hitAttributeEXT vec2 attribs;
 
 void main() {
@@ -42,10 +49,13 @@ void main() {
     vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     vec2 uv = bary.x * uvs.uv[i0] + bary.y * uvs.uv[i1] + bary.z * uvs.uv[i2];
 
-    vec3 albedo = textureLod(blockAtlas, uv, 0.0).rgb * tint;
+    // Orient the normal toward the viewer so the AO/shadow offset and N·L stay correct even if a
+    // back-face is hit.
+    if (dot(n, gl_WorldRayDirectionEXT) > 0.0) {
+        n = -n;
+    }
 
-    const vec3 sunDir = normalize(vec3(0.35, 0.9, 0.25));
-    float ndl = max(0.0, dot(n, sunDir));
-    float ambient = 0.35;
-    payload = albedo * (ambient + 0.75 * ndl);
+    payload.albedo = textureLod(blockAtlas, uv, 0.0).rgb * tint;
+    payload.normal = n;
+    payload.hitT = gl_HitTEXT;
 }

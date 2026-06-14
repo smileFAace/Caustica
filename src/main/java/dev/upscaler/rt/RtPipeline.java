@@ -33,6 +33,7 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_BUFFER_USAGE_SHADER_BIND
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR;
+import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_MISS_BIT_KHR;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_SHADER_STAGE_RAYGEN_BIT_KHR;
@@ -42,10 +43,12 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkCreateRayTracingPipelines
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupHandlesKHR;
 
 /**
- * An RT pipeline with a 3-group SBT (raygen + miss + one triangle hit group) and a descriptor
+ * An RT pipeline with an SBT of {raygen + N miss + one triangle hit group} and a descriptor
  * set of {binding 0 = TLAS, binding 1 = storage image}. Built from SPIR-V resources. Update the
  * bindings with {@link #setTlas}/{@link #setStorageImage}, then {@link #trace}. Reusable across
- * the triangle spike and P1 terrain (extend the descriptor layout there as needed).
+ * the triangle spike and P1 terrain (extend the descriptor layout there as needed). Multiple miss
+ * shaders (e.g. a primary sky miss at index 0 plus a shadow/visibility miss at index 1) are
+ * supported by passing an array; {@code traceRayEXT}'s {@code missIndex} selects among them.
  */
 public final class RtPipeline {
     private static final String SHADER_DIR = "/upscaler/rt/";
@@ -58,10 +61,11 @@ public final class RtPipeline {
     private final long pipeline;
     private final RtBuffer sbt;
     private final long sbtStride;
+    private final int missCount;
     private final int pushConstantSize;
     private boolean destroyed;
 
-    private RtPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, RtBuffer sbt, long stride, int pushConstantSize) {
+    private RtPipeline(RtContext ctx, long dsl, long pool, long set, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
@@ -70,6 +74,7 @@ public final class RtPipeline {
         this.pipeline = pipeline;
         this.sbt = sbt;
         this.sbtStride = stride;
+        this.missCount = missCount;
         this.pushConstantSize = pushConstantSize;
     }
 
@@ -82,7 +87,22 @@ public final class RtPipeline {
     }
 
     public static RtPipeline create(RtContext ctx, String rgen, String rmiss, String rchit, int pushConstantSize, boolean withAtlasSampler) {
+        return create(ctx, rgen, new String[]{rmiss}, rchit, null, pushConstantSize, withAtlasSampler);
+    }
+
+    public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, int pushConstantSize, boolean withAtlasSampler) {
+        return create(ctx, rgen, rmiss, rchit, null, pushConstantSize, withAtlasSampler);
+    }
+
+    /**
+     * Full form. {@code rahit} (nullable) adds an any-hit shader to the single triangle hit group for
+     * alpha-tested cutout geometry — it's an extra pipeline stage but not an extra SBT group, so the
+     * record layout is unchanged. When present, the atlas sampler and push constants are also made
+     * visible to the any-hit stage.
+     */
+    public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler) {
         VkDevice vk = ctx.vk();
+        boolean hasAhit = rahit != null;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int bindingCount = withAtlasSampler ? 3 : 2;
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(bindingCount, stack);
@@ -91,8 +111,9 @@ public final class RtPipeline {
             binds.get(1).binding(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             if (withAtlasSampler) {
+                int atlasStages = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
                 binds.get(2).binding(2).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                        .descriptorCount(1).stageFlags(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
+                        .descriptorCount(1).stageFlags(atlasStages);
             }
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
@@ -116,32 +137,58 @@ public final class RtPipeline {
 
             VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default().pSetLayouts(stack.longs(dsl));
             if (pushConstantSize > 0) {
+                int pcStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                        | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
                 VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
-                        .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR)
+                        .stageFlags(pcStages)
                         .offset(0).size(pushConstantSize);
                 plci.pPushConstantRanges(pcr);
             }
             check(VK10.vkCreatePipelineLayout(vk, plci, null, p), "vkCreatePipelineLayout");
             long layout = p.get(0);
 
+            // Stages: raygen, one miss per rmiss entry, the closest-hit, then (optionally) the any-hit.
+            // The closest-hit stage index is 1 + missCount; the any-hit, if any, follows it. Groups are
+            // raygen + N miss + ONE triangle hit group (the any-hit shares that group, so it adds a
+            // stage but not a group — the SBT record count is unchanged).
+            int missCount = rmiss.length;
+            int groupCount = 1 + missCount + 1;
+            int hitGroupIdx = 1 + missCount;
+            int chitStage = 1 + missCount;
+            int ahitStage = chitStage + 1;
+            int stageCount = groupCount + (hasAhit ? 1 : 0);
             long mGen = loadModule(vk, stack, rgen);
-            long mMiss = loadModule(vk, stack, rmiss);
+            long[] mMiss = new long[missCount];
+            for (int m = 0; m < missCount; m++) {
+                mMiss[m] = loadModule(vk, stack, rmiss[m]);
+            }
             long mHit = loadModule(vk, stack, rchit);
+            long mAhit = hasAhit ? loadModule(vk, stack, rahit) : 0L;
             ByteBuffer entry = stack.UTF8("main");
-            VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(3, stack);
+            VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(stageCount, stack);
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_RAYGEN_BIT_KHR).module(mGen).pName(entry);
-            stages.get(1).sType$Default().stage(VK_SHADER_STAGE_MISS_BIT_KHR).module(mMiss).pName(entry);
-            stages.get(2).sType$Default().stage(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR).module(mHit).pName(entry);
+            for (int m = 0; m < missCount; m++) {
+                stages.get(1 + m).sType$Default().stage(VK_SHADER_STAGE_MISS_BIT_KHR).module(mMiss[m]).pName(entry);
+            }
+            stages.get(chitStage).sType$Default().stage(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR).module(mHit).pName(entry);
+            if (hasAhit) {
+                stages.get(ahitStage).sType$Default().stage(VK_SHADER_STAGE_ANY_HIT_BIT_KHR).module(mAhit).pName(entry);
+            }
 
-            VkRayTracingShaderGroupCreateInfoKHR.Buffer groups = VkRayTracingShaderGroupCreateInfoKHR.calloc(3, stack);
+            VkRayTracingShaderGroupCreateInfoKHR.Buffer groups = VkRayTracingShaderGroupCreateInfoKHR.calloc(groupCount, stack);
             groups.get(0).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
                     .generalShader(0).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
-            groups.get(1).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
-                    .generalShader(1).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
-            groups.get(2).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
-                    .generalShader(VK_SHADER_UNUSED_KHR).closestHitShader(2).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
+            for (int m = 0; m < missCount; m++) {
+                groups.get(1 + m).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
+                        .generalShader(1 + m).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
+            }
+            groups.get(hitGroupIdx).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
+                    .generalShader(VK_SHADER_UNUSED_KHR).closestHitShader(chitStage)
+                    .anyHitShader(hasAhit ? ahitStage : VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
 
             VkRayTracingPipelineCreateInfoKHR.Buffer rtpci = VkRayTracingPipelineCreateInfoKHR.calloc(1, stack);
+            // Depth 1: secondary shadow/visibility rays are issued sequentially from raygen (not
+            // nested in closest-hit), so each traceRayEXT is depth 1 — no recursion budget needed.
             rtpci.get(0).sType$Default().pStages(stages).pGroups(groups).maxPipelineRayRecursionDepth(1).layout(layout);
             LongBuffer pPipeline = stack.mallocLong(1);
             check(vkCreateRayTracingPipelinesKHR(vk, VK10.VK_NULL_HANDLE, VK10.VK_NULL_HANDLE, rtpci, null, pPipeline),
@@ -149,12 +196,16 @@ public final class RtPipeline {
             long pipeline = pPipeline.get(0);
 
             VK10.vkDestroyShaderModule(vk, mGen, null);
-            VK10.vkDestroyShaderModule(vk, mMiss, null);
+            for (int m = 0; m < missCount; m++) {
+                VK10.vkDestroyShaderModule(vk, mMiss[m], null);
+            }
             VK10.vkDestroyShaderModule(vk, mHit, null);
+            if (hasAhit) {
+                VK10.vkDestroyShaderModule(vk, mAhit, null);
+            }
 
             // SBT: one record per group, each region 64-aligned (stride over-aligned to baseAlignment).
             int handleSize = ctx.shaderGroupHandleSize();
-            int groupCount = 3;
             ByteBuffer handles = stack.malloc(groupCount * handleSize);
             check(vkGetRayTracingShaderGroupHandlesKHR(vk, pipeline, 0, groupCount, handles), "vkGetRayTracingShaderGroupHandlesKHR");
             long stride = align(handleSize, ctx.shaderGroupBaseAlignment());
@@ -162,7 +213,7 @@ public final class RtPipeline {
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
-            return new RtPipeline(ctx, dsl, pool, set, layout, pipeline, sbt, stride, pushConstantSize);
+            return new RtPipeline(ctx, dsl, pool, set, layout, pipeline, sbt, stride, missCount, pushConstantSize);
         }
     }
 
@@ -216,9 +267,9 @@ public final class RtPipeline {
             VkStridedDeviceAddressRegionKHR raygen = VkStridedDeviceAddressRegionKHR.calloc(stack)
                     .deviceAddress(sbt.deviceAddress).stride(sbtStride).size(sbtStride);
             VkStridedDeviceAddressRegionKHR miss = VkStridedDeviceAddressRegionKHR.calloc(stack)
-                    .deviceAddress(sbt.deviceAddress + sbtStride).stride(sbtStride).size(sbtStride);
+                    .deviceAddress(sbt.deviceAddress + sbtStride).stride(sbtStride).size((long) missCount * sbtStride);
             VkStridedDeviceAddressRegionKHR hit = VkStridedDeviceAddressRegionKHR.calloc(stack)
-                    .deviceAddress(sbt.deviceAddress + 2L * sbtStride).stride(sbtStride).size(sbtStride);
+                    .deviceAddress(sbt.deviceAddress + (1L + missCount) * sbtStride).stride(sbtStride).size(sbtStride);
             VkStridedDeviceAddressRegionKHR callable = VkStridedDeviceAddressRegionKHR.calloc(stack);
             vkCmdTraceRaysKHR(cmd, raygen, miss, hit, callable, width, height, 1);
         }

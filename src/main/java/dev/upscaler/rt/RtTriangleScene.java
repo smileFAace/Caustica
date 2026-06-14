@@ -53,7 +53,7 @@ public final class RtTriangleScene {
         MemoryUtil.memFloatBuffer(positions.mapped, verts.length).put(verts);
         MemoryUtil.memIntBuffer(indices.mapped, idx.length).put(idx);
 
-        RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, verts.length / 3, indices, idx.length);
+        RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, verts.length / 3, indices, idx.length, true);
         float[] identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
         RtAccel tlas = RtAccel.buildTlas(ctx, List.of(new RtAccel.Instance(identity, blas.deviceAddress)));
         return new RtTriangleScene(positions, indices, blas, tlas);

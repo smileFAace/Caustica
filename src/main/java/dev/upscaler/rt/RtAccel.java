@@ -21,6 +21,7 @@ import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCELERATION_STRUCTUR
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
+import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_OPAQUE_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_TYPE_INSTANCES_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_GEOMETRY_TYPE_TRIANGLES_KHR;
@@ -61,13 +62,19 @@ public final class RtAccel {
         destroyed = true;
     }
 
-    /** Build a bottom-level AS over an indexed triangle mesh (position-only vertex stream). */
+    /**
+     * Build a bottom-level AS over an indexed triangle mesh (position-only vertex stream).
+     * {@code opaque} marks the geometry {@code OPAQUE} (no any-hit, fastest) for solid meshes;
+     * pass {@code false} for alpha-tested cutout geometry so the pipeline's any-hit shader runs
+     * (flagged {@code NO_DUPLICATE_ANY_HIT_INVOCATION} so each primitive's any-hit fires at most once).
+     */
     public static RtAccel buildTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
-                                             RtBuffer indices, int indexCount) {
+                                             RtBuffer indices, int indexCount, boolean opaque) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(1, stack);
-            geom.sType$Default().geometryType(VK_GEOMETRY_TYPE_TRIANGLES_KHR).flags(VK_GEOMETRY_OPAQUE_BIT_KHR);
+            geom.sType$Default().geometryType(VK_GEOMETRY_TYPE_TRIANGLES_KHR)
+                    .flags(opaque ? VK_GEOMETRY_OPAQUE_BIT_KHR : VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR);
             var tri = geom.geometry().triangles();
             tri.sType$Default()
                     .vertexFormat(VK10.VK_FORMAT_R32G32B32_SFLOAT).vertexStride(3L * Float.BYTES)
