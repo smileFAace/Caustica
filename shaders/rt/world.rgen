@@ -18,11 +18,9 @@
 // Russian roulette terminates deep paths; a firefly clamp tames the rare bright spike. Output is
 // HDR (R16G16B16A16_SFLOAT); the HDR -> LDR tonemap happens later at the blend.comp seam.
 //
-// Temporal accumulation (accumulate-when-static, P3.1b): each frame averages SPP paths, then folds
-// that into an incremental running mean stored in the HDR target itself (no extra image/binding). The
-// CPU resets the accumFrame push constant to 0 on any camera move or geometry (TLAS) change; while
-// the viewpoint is static the image converges frame over frame. The RNG is seeded with accumFrame so
-// successive frames draw different paths. (Still no AA jitter — that comes with the P4 denoiser.)
+// Each frame emits a single SPP-averaged (still noisy) estimate; temporal convergence is the
+// denoiser's job (DLSS Ray Reconstruction, P4). With RR disabled the output is the raw noisy path
+// trace — a reference view, not a converged image.
 layout(binding = 0, set = 0) uniform accelerationStructureEXT topLevelAS;
 // HDR trace target (R16G16B16A16_SFLOAT): we write linear radiance which may exceed 1. The
 // HDR -> LDR tonemap happens later, at the blend.comp seam, not here.
@@ -39,17 +37,18 @@ layout(binding = 7, set = 0, rgba16f) uniform image2D gSpecAlbedo; // specular a
 layout(push_constant) uniform Push {
     mat4 invViewProj;
     vec3 camOffset;
-    // Frames already accumulated for the current static viewpoint (0 = first frame after a reset).
-    // Explicit offset 88 leaves the closest-hit/any-hit section-table address at 80 (raygen ignores
-    // that field). Drives the temporal running mean below and decorrelates the per-frame RNG.
-    layout(offset = 88) uint accumFrame;
     // Debug guide-buffer view: 0=render, 1=normals, 2=albedo, 3=depth, 4=roughness, 5=motion.
-    layout(offset = 92) uint debugView;
+    // Explicit offset 88 clears the closest-hit/any-hit section-table address at 80 (raygen ignores it).
+    layout(offset = 88) uint debugView;
+    // Monotonic frame index — varies the per-pixel RNG each frame so the denoiser's temporal reuse has
+    // fresh samples to average (essential at low spp; otherwise identical noise repeats every frame).
+    layout(offset = 92) uint frameIndex;
     // Motion vectors (P4.0b): previous frame's camera-relative view-projection, and the camera's
     // per-frame translation (curCam - prevCam). The current screen position of a primary hit is the
     // pixel centre, so only the previous-frame projection of the same world point is needed.
     layout(offset = 96)  mat4 prevViewProj;
     layout(offset = 160) vec3 camDelta;
+    layout(offset = 172) uint spp; // samples per pixel this frame (>=1); low for the RR-denoised path
 } pc;
 
 // First-hit (primary-visibility) guide attributes, captured at bounce 0 of tracePath. The primary ray
@@ -76,7 +75,6 @@ const vec3 SUN_DIR = normalize(vec3(0.35, 0.9, 0.25));
 const vec3 SUN_RADIANCE = vec3(4.2, 4.0, 3.6); // directional sun irradiance (HDR; tonemapped later)
 const float SKY_GAIN = 1.0;     // scales the sky radiance returned by world.rmiss
 const float EMISSIVE_STRENGTH = 6.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
-const int SPP = 4;              // paths per pixel per frame (raised effective samples come w/ P3.1b)
 const int MAX_BOUNCES = 4;      // indirect bounces before the path is cut
 const int RR_START = 2;         // begin Russian roulette after this bounce index
 const float FIREFLY_MAX = 8.0;  // clamp per-path radiance to tame sampling spikes
@@ -198,16 +196,15 @@ void main() {
     vec3 origin = nearP + pc.camOffset;
     vec3 dir = normalize(farP - nearP);
 
-    // Seed includes accumFrame so each accumulated frame draws a different path set (otherwise the
-    // running mean would fold in identical samples and never converge).
-    uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.accumFrame * 2654435761u);
+    uint seed = (uint(pix.x) * 1973u + uint(pix.y) * 9277u + 26699u) ^ (pc.frameIndex * 2654435761u);
 
+    uint spp = max(pc.spp, 1u);
     vec3 frameRadiance = vec3(0.0);
-    for (int s = 0; s < SPP; s++) {
+    for (uint s = 0u; s < spp; s++) {
         seed = pcg(seed); // decorrelate per-sample paths (shared camera ray, no AA jitter yet)
         frameRadiance += min(tracePath(origin, dir, seed), vec3(FIREFLY_MAX));
     }
-    frameRadiance /= float(SPP);
+    frameRadiance /= float(spp);
 
     // P4.0a guide buffers: first-hit attributes for the denoiser / DLSS-RR (written every frame).
     imageStore(gNormal, pix, vec4(gv_normal, gv_rough));
@@ -240,16 +237,6 @@ void main() {
         return;
     }
 
-    // Temporal accumulation: incremental running mean in the HDR target. accumFrame == 0 means a fresh
-    // viewpoint (camera/geometry just changed), so start over; otherwise blend this frame in at weight
-    // 1/(n+1). Stored values stay in display range (no unbounded growth), so fp16 holds up for the few
-    // hundred frames a static view converges in.
-    vec3 outColor;
-    if (pc.accumFrame == 0u) {
-        outColor = frameRadiance;
-    } else {
-        vec3 prev = imageLoad(outImage, pix).rgb;
-        outColor = prev + (frameRadiance - prev) / float(pc.accumFrame + 1u);
-    }
-    imageStore(outImage, pix, vec4(outColor, 1.0));
+    // Single noisy estimate; the denoiser (DLSS-RR) handles temporal convergence.
+    imageStore(outImage, pix, vec4(frameRadiance, 1.0));
 }

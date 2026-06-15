@@ -37,13 +37,15 @@ public final class RtComposite {
     /** Blend weight of RT over vanilla: 0 = vanilla only, 1 = RT only. {@code -Dupscaler.rt.blend}. */
     public static final float BLEND = parseBlend();
 
-    // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + accumFrame(@88) + debugView(@92)
-    // + prevViewProj(@96) + camDelta(@160)
-    private static final int WORLD_PUSH_SIZE = 172;
+    // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
+    // + prevViewProj(@96) + camDelta(@160) + spp(@172)
+    private static final int WORLD_PUSH_SIZE = 176;
     private static final int GUIDE_COUNT = 5; // P4 guide buffers bound at world-pipeline bindings 3..7
 
     /** Debug guide-buffer view: 0 = normal render, 1 = normals, 2 = albedo, 3 = depth, 4 = roughness. */
     public static final int DEBUG_VIEW = Integer.getInteger("upscaler.rt.debugView", 0);
+    /** Samples per pixel per frame. Default 1: DLSS-RR denoises ~1 spp; raise for the no-RR reference. */
+    public static final int SPP = Math.max(1, Integer.getInteger("upscaler.rt.spp", 1));
 
     private static float parseBlend() {
         try {
@@ -75,8 +77,7 @@ public final class RtComposite {
     private RtImage rrOutput;
 
     // Motion-vector reprojection state (P4.0b): the previous frame's camera-relative view-projection
-    // and camera position. Held separately from the accumulation's last* fields (those are overwritten
-    // before recordFrame); these are read into the push constant, then advanced at frame end.
+    // and camera position, read into the push constant each frame then advanced at frame end.
     private final Matrix4f mvPrevProjView = new Matrix4f();
     private final Matrix4f mvCurProjView = new Matrix4f();
     private final Matrix4f mvPushMatrix = new Matrix4f();
@@ -100,19 +101,6 @@ public final class RtComposite {
     private double camY;
     private double camZ;
     private boolean frameCaptured;
-
-    // Temporal accumulation (P3.1b): frames accumulated for the current static viewpoint, pushed to
-    // world.rgen. Reset to 0 whenever the camera moves, the TLAS changes (geometry edit/load/rebase),
-    // or the screen images are recreated (resize) — i.e. whenever the previous estimate is invalid.
-    private int accumFrame;
-    private boolean haveLastCam;
-    private final Matrix4f lastProjection = new Matrix4f();
-    private final Matrix4f lastViewRotation = new Matrix4f();
-    private double lastCamX;
-    private double lastCamY;
-    private double lastCamZ;
-    private long accumTlas;
-    private boolean accumNeedsReset; // set when images are recreated -> force a reset next frame
 
     private RtComposite() {
     }
@@ -147,7 +135,6 @@ public final class RtComposite {
             ensureOutput(ctx, width, height);
             RtPipeline active = useWorld ? ensureWorld(ctx) : ensureTriangle(ctx);
             if (useWorld) {
-                updateAccumulation(); // after ensureWorld so boundWorldTlas reflects this frame
                 updateMotion();
             }
             recordFrame(active, useWorld, nativeColor, width, height);
@@ -265,8 +252,7 @@ public final class RtComposite {
             // DLSS-RR output. P4.2a is native res (display == render); P4.2b makes this display-res.
             rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
         }
-        accumNeedsReset = true; // the recreated HDR target has no valid accumulation history
-        mvHasPrev = false;      // recreated images -> first MV frame is zero
+        mvHasPrev = false; // recreated images -> first MV frame is zero
         if (trianglePipeline != null) {
             trianglePipeline.setStorageImage(output.view);
         }
@@ -275,29 +261,6 @@ public final class RtComposite {
             bindGuideImages();
         }
         blendPipeline.setImages(baseCopy.view, output.view);
-    }
-
-    /**
-     * Advance (or reset) the temporal accumulation counter for this frame. The estimate stored in the
-     * HDR target is only valid while the viewpoint is static and the geometry unchanged, so reset on
-     * any camera movement, a TLAS swap, or an image recreate; otherwise keep accumulating.
-     */
-    private void updateAccumulation() {
-        long tlas = boundWorldTlas; // set by ensureWorld earlier this frame
-        boolean reset = accumNeedsReset || !haveLastCam
-                || !frameProjection.equals(lastProjection)
-                || !frameViewRotation.equals(lastViewRotation)
-                || camX != lastCamX || camY != lastCamY || camZ != lastCamZ
-                || tlas != accumTlas;
-        accumFrame = reset ? 0 : accumFrame + 1;
-        lastProjection.set(frameProjection);
-        lastViewRotation.set(frameViewRotation);
-        lastCamX = camX;
-        lastCamY = camY;
-        lastCamZ = camZ;
-        accumTlas = tlas;
-        haveLastCam = true;
-        accumNeedsReset = false;
     }
 
     /**
@@ -330,9 +293,6 @@ public final class RtComposite {
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Make the previous frame's HDR-target writes visible before this frame's raygen reads it
-            // back for the temporal running mean (cross-frame read-modify-write on the output image).
-            VulkanCommandEncoder.memoryBarrier(cmd, stack);
             if (useWorld) {
                 RtTerrain terrain = RtTerrain.currentOrNull();
                 ByteBuffer push = stack.malloc(WORLD_PUSH_SIZE);
@@ -341,14 +301,13 @@ public final class RtComposite {
                 push.putFloat(68, (float) (camY - terrain.blockY));
                 push.putFloat(72, (float) (camZ - terrain.blockZ));
                 push.putLong(80, terrain.tableAddress());
-                // DLSS-RR does its own temporal denoise, so feed it a single noisy frame (no
-                // accumulate-when-static) by pushing accumFrame 0 whenever RR is enabled.
-                push.putInt(88, RtDlssRr.ENABLED ? 0 : accumFrame);
-                push.putInt(92, DEBUG_VIEW);
+                push.putInt(88, DEBUG_VIEW);
+                push.putInt(92, (int) frameCounter); // per-frame RNG variation for the denoiser
                 mvPushMatrix.get(96, push);
                 push.putFloat(160, mvCamDeltaX);
                 push.putFloat(164, mvCamDeltaY);
                 push.putFloat(168, mvCamDeltaZ);
+                push.putInt(172, SPP);
                 active.trace(cmd, width, height, push);
                 // P4.2a: DLSS-RR denoise. The RT pass wrote the noisy color into `output` plus the guide
                 // buffers; RR reads them and writes the denoised result into rrOutput, which we copy back
