@@ -1,6 +1,7 @@
 package dev.upscaler.rt;
 
 import com.mojang.blaze3d.vertex.QuadInstance;
+import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.upscaler.UpscalerMod;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
@@ -11,7 +12,9 @@ import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.BlockQuadOutput;
 import net.minecraft.client.renderer.block.BlockStateModelSet;
+import net.minecraft.client.renderer.block.FluidRenderer;
 import net.minecraft.client.renderer.block.ModelBlockRenderer;
+import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.BlockPos;
@@ -207,6 +210,10 @@ public final class RtTerrain {
             QuadCapture capture = new QuadCapture();
             capture.blockColors = mc.getBlockColors();
             capture.view = view;
+            // Fluids (water/lava) have no baked model — they're meshed by FluidRenderer into a
+            // VertexConsumer. FluidCapture is both the Output and the capturing builder.
+            FluidRenderer fluidRenderer = new FluidRenderer(mc.getModelManager().getFluidStateModelSet());
+            FluidCapture fluidCapture = new FluidCapture();
             BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
             int budget = SECTIONS_PER_TICK;
             for (int[] s : missing) {
@@ -215,7 +222,7 @@ public final class RtTerrain {
                 }
                 budget--;
                 long key = sectionKey(s[0], s[1], s[2]);
-                PreparedSection ps = prepareSection(ctx, level, modelSet, renderer, view, capture, m, key, s[0], s[1], s[2]);
+                PreparedSection ps = prepareSection(ctx, level, modelSet, renderer, view, capture, fluidRenderer, fluidCapture, m, key, s[0], s[1], s[2]);
                 if (ps != null) {
                     prepared.add(ps);
                 } else {
@@ -242,17 +249,35 @@ public final class RtTerrain {
     /** Tessellate one section (section-local), upload its buffers, and prepare (not yet build) its BLAS; null if empty. */
     private PreparedSection prepareSection(RtContext ctx, ClientLevel level, BlockStateModelSet modelSet,
                                            ModelBlockRenderer renderer, BlockAndTintGetter view, QuadCapture capture,
+                                           FluidRenderer fluidRenderer, FluidCapture fluidCapture,
                                            BlockPos.MutableBlockPos m, long key, int scx, int scy, int scz) {
         int sox = scx << 4, soy = scy << 4, soz = scz << 4;
         SectionMesh mesh = new SectionMesh();
         capture.cur = mesh;
+        fluidCapture.cur = mesh;
         for (int lx = 0; lx < 16; lx++) {
             for (int ly = 0; ly < 16; ly++) {
                 for (int lz = 0; lz < 16; lz++) {
                     int wx = sox + lx, wy = soy + ly, wz = soz + lz;
                     m.set(wx, wy, wz);
                     BlockState state = level.getBlockState(m);
-                    if (state.isAir() || state.getRenderShape() != RenderShape.MODEL) {
+                    if (state.isAir()) {
+                        continue;
+                    }
+                    // Fluids (water/lava, incl. waterlogged blocks): separate mesher, INVISIBLE render
+                    // shape, so handled independently of the block model below. FluidRenderer emits
+                    // section-local coords + atlas sprite UVs straight into the capturing consumer.
+                    // Lava's block light (15) rides the same emission channel as P3.2a (water emits 0).
+                    FluidState fluid = state.getFluidState();
+                    if (!fluid.isEmpty()) {
+                        fluidCapture.emission = state.getLightEmission() / 15f;
+                        try {
+                            fluidRenderer.tesselate(view, m, fluidCapture, state, fluid);
+                        } catch (Throwable t) {
+                            // skip a fluid whose meshing throws rather than failing the section
+                        }
+                    }
+                    if (state.getRenderShape() != RenderShape.MODEL) {
                         continue;
                     }
                     BlockStateModel model = modelSet.get(state);
@@ -565,6 +590,89 @@ public final class RtTerrain {
             cur.uvList.add(Float.intBitsToFloat((int) (packedUV >>> 32)));
             cur.uvList.add(Float.intBitsToFloat((int) packedUV));
         }
+    }
+
+    /**
+     * Captures the quads {@link FluidRenderer} emits (water/lava) into the current section's mesh. It
+     * is both the {@link FluidRenderer.Output} and the {@link VertexConsumer} it hands back. Vertices
+     * arrive in groups of 4 (one quad) via the bulk {@code addVertex}; we keep position + atlas UV,
+     * compute a geometric normal (sign is irrelevant — the closest-hit flips it toward the viewer), and
+     * emit two triangles like {@link QuadCapture}. Coords are already section-local (FluidRenderer uses
+     * {@code pos & 15}). The cardinal-lit vertex colour is dropped — albedo comes from the atlas in the
+     * hit shader, same as blocks. Tint is left white (biome water tint is deferred to P5 water work).
+     */
+    private static final class FluidCapture implements VertexConsumer, FluidRenderer.Output {
+        SectionMesh cur;     // set before each section
+        float emission;      // set per fluid block (lava = 1, water = 0)
+        private int n;
+        private final float[] qx = new float[4], qy = new float[4], qz = new float[4], qu = new float[4], qv = new float[4];
+
+        @Override
+        public VertexConsumer getBuilder(ChunkSectionLayer layer) {
+            return this; // one capturing builder regardless of the fluid's render layer
+        }
+
+        @Override
+        public void addVertex(float x, float y, float z, int color, float u, float v,
+                              int overlay, int light, float nx, float ny, float nz) {
+            qx[n] = x; qy[n] = y; qz[n] = z; qu[n] = u; qv[n] = v;
+            if (++n == 4) {
+                emitQuad();
+                n = 0;
+            }
+        }
+
+        private void emitQuad() {
+            FloatArrayList verts = cur.verts;
+            IntArrayList idx = cur.idx;
+            int base = verts.size() / 3;
+            for (int i = 0; i < 4; i++) {
+                verts.add(qx[i]);
+                verts.add(qy[i]);
+                verts.add(qz[i]);
+                cur.uvList.add(qu[i]);
+                cur.uvList.add(qv[i]);
+            }
+            idx.add(base);
+            idx.add(base + 1);
+            idx.add(base + 2);
+            idx.add(base);
+            idx.add(base + 2);
+            idx.add(base + 3);
+
+            float ex1 = qx[1] - qx[0], ey1 = qy[1] - qy[0], ez1 = qz[1] - qz[0];
+            float ex2 = qx[2] - qx[0], ey2 = qy[2] - qy[0], ez2 = qz[2] - qz[0];
+            float nx = ey1 * ez2 - ez1 * ey2;
+            float ny = ez1 * ex2 - ex1 * ez2;
+            float nz = ex1 * ey2 - ey1 * ex2;
+            float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            if (len > 1.0e-6f) {
+                nx /= len;
+                ny /= len;
+                nz /= len;
+            }
+            FloatArrayList prim = cur.prim;
+            for (int t = 0; t < 2; t++) { // one {normal+emission, tint} record per triangle
+                prim.add(nx);
+                prim.add(ny);
+                prim.add(nz);
+                prim.add(emission);
+                prim.add(1f);
+                prim.add(1f);
+                prim.add(1f);
+                prim.add(0f);
+            }
+        }
+
+        // Unused VertexConsumer surface — FluidRenderer only calls the bulk addVertex above.
+        @Override public VertexConsumer addVertex(float x, float y, float z) { return this; }
+        @Override public VertexConsumer setColor(int r, int g, int b, int a) { return this; }
+        @Override public VertexConsumer setColor(int color) { return this; }
+        @Override public VertexConsumer setUv(float u, float v) { return this; }
+        @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv2(int u, int v) { return this; }
+        @Override public VertexConsumer setNormal(float x, float y, float z) { return this; }
+        @Override public VertexConsumer setLineWidth(float width) { return this; }
     }
 
     /** Minimal {@link BlockAndTintGetter} over the client level so the model renderer can cull + tint. */
