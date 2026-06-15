@@ -25,40 +25,46 @@ import net.minecraft.world.level.material.FluidState;
 import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
- * P1 step 4a: extract real block-model geometry around the player. Each non-air MODEL block is
- * tessellated through vanilla's {@link ModelBlockRenderer} into a capturing {@link BlockQuadOutput},
- * giving correct shapes and neighbour-culled faces without touching the (refactored) model API
- * directly. Positions are rebased to the player's block.
+ * P2 step 1: per-section terrain residency. Block-model geometry around the player is tessellated
+ * through vanilla's {@link ModelBlockRenderer} (correct shapes + neighbour-culled faces, biome tint,
+ * alpha-cutout via the any-hit), but instead of one giant snapshot BLAS the geometry is grouped by
+ * 16³ chunk section: each non-empty section gets its own buffers + BLAS, and a single TLAS holds one
+ * instance per section.
  *
- * <p>Per-vertex stream: position (BLAS). Per-primitive stream ({@code material}, indexed by
- * gl_PrimitiveID): geometric normal + albedo. Albedo is white for now — biome tint + atlas UV
- * textures come in step 4b.
+ * <p>Vertices are stored <b>section-local</b> (small coords → f32-exact). Each TLAS instance carries
+ * a translation {@code sectionOrigin − rebaseOrigin} and an {@code instanceCustomIndex} into a BDA
+ * <b>section table</b> ({@code {primAddr, idxAddr, uvAddr}} per section); the closest-hit/any-hit read
+ * {@code gl_InstanceCustomIndexEXT} to find the hit section's geometry buffers. This is the structure
+ * the lifecycle (load/unload/edit) and per-frame camera-relative TLAS rebuilds build on; the visible
+ * result is identical to the single-BLAS snapshot.
  */
 public final class RtTerrain {
     public static final boolean ENABLED = Boolean.parseBoolean(System.getProperty("upscaler.rt.terrain", "true"));
     private static final int RADIUS = Integer.getInteger("upscaler.rt.terrainRadius", 16);
+    // Re-extract once the player drifts this many blocks from the last snapshot center. Keep it well
+    // below RADIUS so the player never reaches the snapshot edge before it refreshes.
+    private static final int REEXTRACT_THRESHOLD = Integer.getInteger("upscaler.rt.reextract", 8);
 
     private static RtTerrain instance;
 
-    private final RtBuffer positions;
-    private final RtBuffer indices;
-    private final RtBuffer uvs;      // per-vertex: vec2 atlas UV
-    private final RtBuffer material; // per-primitive: {vec4 normal, vec4 tint}
-    private final RtAccel blas;
+    private final List<RtBuffer> buffers;   // all per-section geometry buffers (positions/indices/uvs/material)
+    private final List<RtAccel> blasList;   // one BLAS per section
+    private final RtBuffer sectionTable;    // BDA array of {u64 primAddr, u64 idxAddr, u64 uvAddr} per section
     private final RtAccel tlas;
-    public final int blockX;
+    public final int blockX;                // rebase origin (player block) for the instance transforms
     public final int blockY;
     public final int blockZ;
 
-    private RtTerrain(RtBuffer positions, RtBuffer indices, RtBuffer uvs, RtBuffer material, RtAccel blas, RtAccel tlas, int bx, int by, int bz) {
-        this.positions = positions;
-        this.indices = indices;
-        this.uvs = uvs;
-        this.material = material;
-        this.blas = blas;
+    private RtTerrain(List<RtBuffer> buffers, List<RtAccel> blasList, RtBuffer sectionTable, RtAccel tlas, int bx, int by, int bz) {
+        this.buffers = buffers;
+        this.blasList = blasList;
+        this.sectionTable = sectionTable;
         this.tlas = tlas;
         this.blockX = bx;
         this.blockY = by;
@@ -73,19 +79,37 @@ public final class RtTerrain {
         return tlas.handle;
     }
 
-    /** Device address of the per-primitive material buffer ({vec4 normal, vec4 tint} per triangle). */
-    public long primAddress() {
-        return material.deviceAddress;
+    /** Device address of the section table: {@code {u64 primAddr, u64 idxAddr, u64 uvAddr}} per section, indexed by gl_InstanceCustomIndexEXT. */
+    public long tableAddress() {
+        return sectionTable.deviceAddress;
     }
 
-    /** Device address of the index buffer (uint per index) — for per-vertex UV lookup in the hit shader. */
-    public long indexAddress() {
-        return indices.deviceAddress;
-    }
-
-    /** Device address of the per-vertex UV buffer (vec2 atlas UV per vertex). */
-    public long uvAddress() {
-        return uvs.deviceAddress;
+    /**
+     * (Re)extract the snapshot if none exists yet, or once the player has drifted past
+     * {@link #REEXTRACT_THRESHOLD} blocks from the current snapshot center — a sliding snapshot that
+     * follows the player. Each re-extraction re-rebases to the new player block, so vertices and
+     * instance transforms stay small (f32-exact) at any absolute world coordinate. Called per tick;
+     * self-throttles via the distance gate. (Crude full rebuild for now — incremental per-section
+     * load/unload + a per-frame TLAS is the next refinement.)
+     */
+    public static boolean maybeExtract(RtContext ctx) {
+        if (!ENABLED) {
+            return false;
+        }
+        RtTerrain cur = instance;
+        if (cur != null) {
+            Minecraft mc = Minecraft.getInstance();
+            if (mc.player == null) {
+                return false;
+            }
+            BlockPos p = mc.player.blockPosition();
+            int drift = Math.max(Math.abs(p.getX() - cur.blockX),
+                    Math.max(Math.abs(p.getY() - cur.blockY), Math.abs(p.getZ() - cur.blockZ)));
+            if (drift < REEXTRACT_THRESHOLD) {
+                return false; // still near the snapshot center; keep the current geometry
+            }
+        }
+        return extractAroundPlayer(ctx);
     }
 
     public static boolean extractAroundPlayer(RtContext ctx) {
@@ -110,12 +134,16 @@ public final class RtTerrain {
         capture.blockColors = mc.getBlockColors();
         capture.view = view;
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        // Sections are accumulated lazily as blocks are visited; LinkedHashMap keeps a stable order
+        // so the table index == TLAS instance index == gl_InstanceCustomIndexEXT.
+        Map<Long, Section> sectionMap = new LinkedHashMap<>();
         int blocks = 0;
 
         for (int dx = -RADIUS; dx <= RADIUS; dx++) {
             for (int dy = -RADIUS; dy <= RADIUS; dy++) {
                 for (int dz = -RADIUS; dz <= RADIUS; dz++) {
-                    m.set(cx + dx, cy + dy, cz + dz);
+                    int wx = cx + dx, wy = cy + dy, wz = cz + dz;
+                    m.set(wx, wy, wz);
                     BlockState state = level.getBlockState(m);
                     if (state.isAir() || state.getRenderShape() != RenderShape.MODEL) {
                         continue;
@@ -124,10 +152,14 @@ public final class RtTerrain {
                     if (model == null) {
                         continue;
                     }
+                    int sox = (wx >> 4) << 4, soy = (wy >> 4) << 4, soz = (wz >> 4) << 4;
+                    Section section = sectionMap.computeIfAbsent(sectionKey(wx, wy, wz), k -> new Section(sox, soy, soz));
                     try {
+                        capture.cur = section;
                         capture.state = state;
                         capture.pos = m;
-                        renderer.tesselateBlock(capture, dx, dy, dz, view, m, state, model, state.getSeed(m));
+                        // Section-local block offset (0..15) so emitted vertices are section-local.
+                        renderer.tesselateBlock(capture, wx - sox, wy - soy, wz - soz, view, m, state, model, state.getSeed(m));
                         blocks++;
                     } catch (Throwable t) {
                         // skip a block whose model rendering throws rather than failing the whole snapshot
@@ -136,56 +168,124 @@ public final class RtTerrain {
             }
         }
 
-        if (capture.idx.isEmpty()) {
+        List<Section> sections = new ArrayList<>();
+        for (Section s : sectionMap.values()) {
+            if (!s.idx.isEmpty()) {
+                sections.add(s);
+            }
+        }
+        if (sections.isEmpty()) {
             UpscalerMod.LOGGER.info("RT terrain: no model geometry around ({},{},{}) — skipping", cx, cy, cz);
             return false;
         }
 
-        int vertCount = capture.verts.size() / 3;
-        int idxCount = capture.idx.size();
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer positions = ctx.createBuffer((long) capture.verts.size() * Float.BYTES, asInput, true);
-        RtBuffer indices = ctx.createBuffer((long) capture.idx.size() * Integer.BYTES, asInput | storage, true);
-        RtBuffer uvs = ctx.createBuffer((long) capture.uvList.size() * Float.BYTES, storage, true);
-        RtBuffer material = ctx.createBuffer((long) capture.prim.size() * Float.BYTES, storage, true);
-        MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
-        MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
-        MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
-        MemoryUtil.memFloatBuffer(material.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
+        List<RtBuffer> buffers = new ArrayList<>();
+        List<RtAccel> blasList = new ArrayList<>();
+        List<RtAccel.Instance> instances = new ArrayList<>();
+        long[] primAddr = new long[sections.size()];
+        long[] idxAddr = new long[sections.size()];
+        long[] uvAddr = new long[sections.size()];
+        int totalTris = 0;
+        int totalVerts = 0;
 
-        // Cutout geometry: non-opaque so the any-hit shader alpha-tests the atlas (foliage/glass).
-        RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false);
-        float[] identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
-        RtAccel tlas = RtAccel.buildTlas(ctx, List.of(new RtAccel.Instance(identity, blas.deviceAddress)));
+        for (int i = 0; i < sections.size(); i++) {
+            Section s = sections.get(i);
+            int vertCount = s.verts.size() / 3;
+            int idxCount = s.idx.size();
+            RtBuffer positions = ctx.createBuffer((long) s.verts.size() * Float.BYTES, asInput, true);
+            RtBuffer indices = ctx.createBuffer((long) s.idx.size() * Integer.BYTES, asInput | storage, true);
+            RtBuffer uvs = ctx.createBuffer((long) s.uvList.size() * Float.BYTES, storage, true);
+            RtBuffer material = ctx.createBuffer((long) s.prim.size() * Float.BYTES, storage, true);
+            MemoryUtil.memFloatBuffer(positions.mapped, s.verts.size()).put(s.verts.elements(), 0, s.verts.size());
+            MemoryUtil.memIntBuffer(indices.mapped, s.idx.size()).put(s.idx.elements(), 0, s.idx.size());
+            MemoryUtil.memFloatBuffer(uvs.mapped, s.uvList.size()).put(s.uvList.elements(), 0, s.uvList.size());
+            MemoryUtil.memFloatBuffer(material.mapped, s.prim.size()).put(s.prim.elements(), 0, s.prim.size());
+
+            // Cutout geometry: non-opaque so the any-hit shader alpha-tests the atlas (foliage/glass).
+            RtAccel blas = RtAccel.buildTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false);
+            buffers.add(positions);
+            buffers.add(indices);
+            buffers.add(uvs);
+            buffers.add(material);
+            blasList.add(blas);
+            primAddr[i] = material.deviceAddress;
+            idxAddr[i] = indices.deviceAddress;
+            uvAddr[i] = uvs.deviceAddress;
+
+            // Pure-translation instance transform: sectionOrigin − rebaseOrigin (player block). Combined
+            // with section-local BLAS vertices this puts geometry at world − rebaseOrigin, matching the
+            // ray origin's camOffset. A future step rebuilds this per frame relative to the camera.
+            float[] xform = {1, 0, 0, s.sx - cx, 0, 1, 0, s.sy - cy, 0, 0, 1, s.sz - cz};
+            instances.add(new RtAccel.Instance(xform, blas.deviceAddress));
+            totalTris += idxCount / 3;
+            totalVerts += vertCount;
+        }
+
+        RtBuffer sectionTable = ctx.createBuffer((long) sections.size() * SECTION_ENTRY_BYTES, storage, true);
+        for (int i = 0; i < sections.size(); i++) {
+            long base = sectionTable.mapped + (long) i * SECTION_ENTRY_BYTES;
+            MemoryUtil.memPutLong(base, primAddr[i]);
+            MemoryUtil.memPutLong(base + 8, idxAddr[i]);
+            MemoryUtil.memPutLong(base + 16, uvAddr[i]);
+        }
+
+        RtAccel tlas = RtAccel.buildTlas(ctx, instances);
 
         if (instance != null) {
+            ctx.waitIdle(); // a previous frame may still read the old AS/buffers before we free them
             instance.destroy();
         }
-        instance = new RtTerrain(positions, indices, uvs, material, blas, tlas, cx, cy, cz);
-        UpscalerMod.LOGGER.info("RT terrain: {} blocks -> {} triangles ({} verts) around ({},{},{}); BLAS+TLAS built",
-                blocks, idxCount / 3, vertCount, cx, cy, cz);
+        instance = new RtTerrain(buffers, blasList, sectionTable, tlas, cx, cy, cz);
+        UpscalerMod.LOGGER.info("RT terrain: {} blocks -> {} triangles ({} verts) in {} sections around ({},{},{}); per-section BLAS + TLAS built",
+                blocks, totalTris, totalVerts, sections.size(), cx, cy, cz);
         return true;
     }
 
     public void destroy() {
         tlas.destroy();
-        blas.destroy();
-        material.destroy();
-        uvs.destroy();
-        indices.destroy();
-        positions.destroy();
+        for (RtAccel blas : blasList) {
+            blas.destroy();
+        }
+        sectionTable.destroy();
+        for (RtBuffer b : buffers) {
+            b.destroy();
+        }
         if (instance == this) {
             instance = null;
         }
     }
 
-    /** Captures the quads vanilla's model renderer emits into RT position/index/material streams. */
-    private static final class QuadCapture implements BlockQuadOutput {
+    /** 24-byte section table entry: {u64 primAddr, u64 idxAddr, u64 uvAddr} (std430 stride). */
+    private static final int SECTION_ENTRY_BYTES = 24;
+
+    /** Pack section coords (block >> 4) into a stable map key; ranges fit comfortably in the masks. */
+    private static long sectionKey(int wx, int wy, int wz) {
+        long scx = wx >> 4, scy = wy >> 4, scz = wz >> 4;
+        return (scx & 0x3FFFFFFL) | ((scz & 0x3FFFFFFL) << 26) | ((scy & 0xFFFL) << 52);
+    }
+
+    /** Accumulates one section's quads (section-local) into RT position/index/uv/material streams. */
+    private static final class Section {
+        final int sx;
+        final int sy;
+        final int sz; // section origin in world blocks
         final FloatArrayList verts = new FloatArrayList();
         final IntArrayList idx = new IntArrayList();
         final FloatArrayList uvList = new FloatArrayList(); // 2 floats/vertex: atlas UV
-        final FloatArrayList prim = new FloatArrayList(); // 8 floats/triangle: normal.xyz0, tint.rgb0
+        final FloatArrayList prim = new FloatArrayList();   // 8 floats/triangle: normal.xyz0, tint.rgb0
+
+        Section(int sx, int sy, int sz) {
+            this.sx = sx;
+            this.sy = sy;
+            this.sz = sz;
+        }
+    }
+
+    /** Captures the quads vanilla's model renderer emits into the current section's streams. */
+    private static final class QuadCapture implements BlockQuadOutput {
+        Section cur; // set before each tesselateBlock call
 
         // Per-block context for biome tint, set before each tesselateBlock call. We resolve the tint
         // straight from BlockColors (pure biome color) rather than QuadInstance.getColor, which bakes
@@ -197,6 +297,8 @@ public final class RtTerrain {
 
         @Override
         public void put(float x, float y, float z, BakedQuad quad, QuadInstance instance) {
+            FloatArrayList verts = cur.verts;
+            IntArrayList idx = cur.idx;
             int base = verts.size() / 3;
             Vector3fc p0 = quad.position(0);
             Vector3fc p1 = quad.position(1);
@@ -243,6 +345,7 @@ public final class RtTerrain {
                 }
             }
 
+            FloatArrayList prim = cur.prim;
             for (int t = 0; t < 2; t++) { // one {normal, tint} record per triangle
                 prim.add(nx);
                 prim.add(ny);
@@ -256,15 +359,15 @@ public final class RtTerrain {
         }
 
         private void addVertex(Vector3fc p, float x, float y, float z) {
-            verts.add(p.x() + x);
-            verts.add(p.y() + y);
-            verts.add(p.z() + z);
+            cur.verts.add(p.x() + x);
+            cur.verts.add(p.y() + y);
+            cur.verts.add(p.z() + z);
         }
 
         private void addUv(long packedUV) {
             // UVPair packs u in the high 32 bits, v in the low 32 (atlas-space, no sprite remap needed).
-            uvList.add(Float.intBitsToFloat((int) (packedUV >>> 32)));
-            uvList.add(Float.intBitsToFloat((int) packedUV));
+            cur.uvList.add(Float.intBitsToFloat((int) (packedUV >>> 32)));
+            cur.uvList.add(Float.intBitsToFloat((int) packedUV));
         }
     }
 

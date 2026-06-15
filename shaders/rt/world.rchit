@@ -3,28 +3,32 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// P1 closest-hit. Resolves block albedo (atlas * tint) and the geometric normal, then writes them
-// plus the hit distance into the payload. Lighting is done in raygen (deferred), so this shader does
-// no shading or secondary tracing. Per-primitive {normal, tint} (gl_PrimitiveID) + per-vertex atlas
-// UVs (index buffer -> UV buffer, barycentric-interpolated). textureLod 0 since rays have no
-// derivatives (ray-cone LOD is a later optimization).
+// P2 closest-hit. Geometry is per-section: gl_InstanceCustomIndexEXT indexes a section table (BDA
+// array reached from the push constant) holding this section's {prim, index, uv} buffer addresses.
+// From there it's the same as before: per-primitive {normal, tint} (gl_PrimitiveID) + per-vertex
+// atlas UVs (index buffer -> UV buffer, barycentric-interpolated) -> atlas albedo. Lighting is done
+// in raygen (deferred), so this writes albedo/normal/hitT into the payload and does no shading.
 struct Prim {
     vec4 normal;
     vec4 tint;
+};
+struct Section {
+    uint64_t primAddr;
+    uint64_t idxAddr;
+    uint64_t uvAddr;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer Prims { Prim p[]; };
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Indices { uint i[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer UVs { vec2 uv[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer SectionTable { Section s[]; };
 
 layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
 
 layout(push_constant) uniform Push {
     mat4 invViewProj;
     vec3 camOffset;
-    uint64_t primAddr;
-    uint64_t idxAddr;
-    uint64_t uvAddr;
+    uint64_t tableAddr;
 } pc;
 
 struct Payload {
@@ -36,13 +40,14 @@ layout(location = 0) rayPayloadInEXT Payload payload;
 hitAttributeEXT vec2 attribs;
 
 void main() {
+    Section sec = SectionTable(pc.tableAddr).s[gl_InstanceCustomIndexEXT];
     uint pid = gl_PrimitiveID;
-    Prim pr = Prims(pc.primAddr).p[pid];
+    Prim pr = Prims(sec.primAddr).p[pid];
     vec3 n = normalize(pr.normal.xyz);
     vec3 tint = pr.tint.rgb;
 
-    Indices indices = Indices(pc.idxAddr);
-    UVs uvs = UVs(pc.uvAddr);
+    Indices indices = Indices(sec.idxAddr);
+    UVs uvs = UVs(sec.uvAddr);
     uint i0 = indices.i[3u * pid + 0u];
     uint i1 = indices.i[3u * pid + 1u];
     uint i2 = indices.i[3u * pid + 2u];

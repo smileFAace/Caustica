@@ -14,7 +14,6 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 public final class UpscalerClient implements ClientModInitializer {
 	private static boolean smokeTestDone = false;
 	private static boolean rtInitDone = false;
-	private static boolean terrainDone = false;
 
 	@Override
 	public void onInitializeClient() {
@@ -40,11 +39,12 @@ public final class UpscalerClient implements ClientModInitializer {
 				}
 			}
 
-			// P1: once RT is up and the player is in a world, extract terrain once.
-			if (rtInitDone && RtTerrain.ENABLED && !terrainDone) {
+			// P2: once RT is up and the player is in a world, keep a snapshot loaded around the
+			// player — (re)extract on first entry and whenever the player drifts far enough.
+			if (rtInitDone && RtTerrain.ENABLED) {
 				RtContext ctx = RtContext.currentOrNull();
-				if (ctx != null && RtTerrain.extractAroundPlayer(ctx)) {
-					terrainDone = true;
+				if (ctx != null) {
+					RtTerrain.maybeExtract(ctx);
 				}
 			}
 		});

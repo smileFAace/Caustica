@@ -37,7 +37,7 @@ public final class RtComposite {
     /** Blend weight of RT over vanilla: 0 = vanilla only, 1 = RT only. {@code -Dupscaler.rt.blend}. */
     public static final float BLEND = parseBlend();
 
-    private static final int WORLD_PUSH_SIZE = 104; // invViewProj(64) + camOffset(@64) + primAddr(@80) + idxAddr(@88) + uvAddr(@96)
+    private static final int WORLD_PUSH_SIZE = 88; // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80)
 
     private static float parseBlend() {
         try {
@@ -179,9 +179,7 @@ public final class RtComposite {
                 push.putFloat(64, (float) (camX - terrain.blockX));
                 push.putFloat(68, (float) (camY - terrain.blockY));
                 push.putFloat(72, (float) (camZ - terrain.blockZ));
-                push.putLong(80, terrain.primAddress());
-                push.putLong(88, terrain.indexAddress());
-                push.putLong(96, terrain.uvAddress());
+                push.putLong(80, terrain.tableAddress());
                 active.trace(cmd, width, height, push);
             } else {
                 active.trace(cmd, width, height);

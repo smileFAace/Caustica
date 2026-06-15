@@ -3,22 +3,26 @@
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
-// Any-hit alpha cutout. Cutout geometry (foliage/glass) is built non-opaque, so this runs at each
-// candidate hit: interpolate the atlas UV (same math as the closest-hit) and discard the hit when
-// the texel's alpha is below the cutoff, letting the ray pass through the transparent texels of
-// leaves/grass/etc. Accepted hits fall through to the closest-hit for shading. Solid blocks (atlas
-// alpha = 1) are always accepted, so a single shared any-hit is correct for the whole BLAS.
+// Any-hit alpha cutout (P2: per-section). gl_InstanceCustomIndexEXT indexes the section table to
+// find this section's index/uv buffers, then it interpolates the atlas UV (same math as the
+// closest-hit) and discards the hit when the texel alpha is below the cutoff, letting the ray pass
+// through the transparent texels of leaves/grass/etc. Accepted hits fall through to the closest-hit.
+struct Section {
+    uint64_t primAddr;
+    uint64_t idxAddr;
+    uint64_t uvAddr;
+};
+
 layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer Indices { uint i[]; };
 layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer UVs { vec2 uv[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) readonly buffer SectionTable { Section s[]; };
 
 layout(binding = 2, set = 0) uniform sampler2D blockAtlas;
 
 layout(push_constant) uniform Push {
     mat4 invViewProj;
     vec3 camOffset;
-    uint64_t primAddr;
-    uint64_t idxAddr;
-    uint64_t uvAddr;
+    uint64_t tableAddr;
 } pc;
 
 hitAttributeEXT vec2 attribs;
@@ -26,9 +30,10 @@ hitAttributeEXT vec2 attribs;
 const float ALPHA_CUTOFF = 0.5;
 
 void main() {
+    Section sec = SectionTable(pc.tableAddr).s[gl_InstanceCustomIndexEXT];
     uint pid = gl_PrimitiveID;
-    Indices indices = Indices(pc.idxAddr);
-    UVs uvs = UVs(pc.uvAddr);
+    Indices indices = Indices(sec.idxAddr);
+    UVs uvs = UVs(sec.uvAddr);
     uint i0 = indices.i[3u * pid + 0u];
     uint i1 = indices.i[3u * pid + 1u];
     uint i2 = indices.i[3u * pid + 2u];
