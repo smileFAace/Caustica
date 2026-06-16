@@ -49,6 +49,10 @@ public final class RtComposite {
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176)
     private static final int WORLD_PUSH_SIZE = 184;
     private static final int GUIDE_COUNT = 5; // P4 guide buffers bound at world-pipeline bindings 3..7
+    // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
+    // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
+    // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
+    private static final int KEEP_FRAMES = 4;
 
     /** Debug guide-buffer view: 0 = normal render, 1 = normals, 2 = albedo, 3 = depth, 4 = roughness. */
     public static final int DEBUG_VIEW = Integer.getInteger("upscaler.rt.debugView", 0);
@@ -120,7 +124,6 @@ public final class RtComposite {
     private float mvCamDeltaY;
     private float mvCamDeltaZ;
     private boolean mvHasPrev;
-    private long boundWorldTlas;
     private long atlasSampler;
     private boolean failed;
     private boolean loggedActive;
@@ -132,6 +135,14 @@ public final class RtComposite {
     private double camY;
     private double camZ;
     private boolean frameCaptured;
+
+    // Per-frame TLASes awaiting a frames-in-flight-safe free (the build + trace that used them must
+    // finish first). Each is retired at the composite frame counter it was built on + KEEP_FRAMES.
+    private final java.util.List<DeferredTlas> deferredTlas = new java.util.ArrayList<>();
+
+    /** A per-frame TLAS retired for a frames-in-flight-safe free once {@code freeFrame} is reached. */
+    private record DeferredTlas(long freeFrame, RtAccel.PreparedTlas tlas) {
+    }
 
     private RtComposite() {
     }
@@ -155,6 +166,7 @@ public final class RtComposite {
         if (ctx == null) {
             return false;
         }
+        processDeferredTlasFrees(); // free per-frame TLASes now safely past their frames-in-flight window
         if (RtTerrain.currentOrNull() == null || !frameCaptured) {
             return false; // no terrain extracted yet
         }
@@ -165,7 +177,7 @@ public final class RtComposite {
             ensureOutput(ctx, width, height);
             RtPipeline active = ensureWorld(ctx);
             updateMotion();
-            recordFrame(active, nativeColor);
+            recordFrame(ctx, active, nativeColor);
             if (!loggedActive) {
                 loggedActive = true;
                 UpscalerMod.LOGGER.info("RT composite active (terrain): {}x{}, RT blended at {} over the world target",
@@ -190,11 +202,8 @@ public final class RtComposite {
             }
             worldPipeline.setAtlasSampler(blockAtlasView(), atlasSampler(ctx));
         }
-        long tlas = RtTerrain.currentOrNull().tlas();
-        if (boundWorldTlas != tlas) {
-            worldPipeline.setTlas(tlas);
-            boundWorldTlas = tlas;
-        }
+        // The TLAS is no longer bound here — it's rebuilt and bound per frame in recordFrame (P5.1a),
+        // since dynamic content (entities, P5.1b) animates the instance set every frame.
         return worldPipeline;
     }
 
@@ -305,7 +314,7 @@ public final class RtComposite {
         mvHasPrev = true;
     }
 
-    private void recordFrame(RtPipeline active, GpuTexture nativeColor) {
+    private void recordFrame(RtContext ctx, RtPipeline active, GpuTexture nativeColor) {
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
@@ -338,6 +347,18 @@ public final class RtComposite {
             push.putInt(172, SPP);
             push.putFloat(176, jitterX);
             push.putFloat(180, jitterY);
+
+            // P5.1a: rebuild the TLAS this frame from the static section instances (later merged with
+            // dynamic entity instances), bind it into the pipeline's descriptor ring, record the build
+            // into this frame's command buffer, then barrier so the trace sees the finished TLAS. The
+            // section BLAS are already built (async, by RtTerrain); only the cheap instance-level TLAS
+            // is rebuilt per frame. Retired KEEP_FRAMES later, once this frame is no longer in flight.
+            RtAccel.PreparedTlas frameTlas = RtAccel.prepareTlas(ctx, terrain.staticInstances());
+            active.setTlas(frameTlas.accel.handle);
+            RtAccel.recordTlasBuild(cmd, frameTlas);
+            VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
+            deferredTlas.add(new DeferredTlas(frameCounter + KEEP_FRAMES, frameTlas));
+
             active.trace(cmd, renderW, renderH, push);
             // P4.2b: DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
             // RR reads them and writes the display-res denoised result straight into rrOutput, which
@@ -377,7 +398,28 @@ public final class RtComposite {
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
     }
 
+    /** Free per-frame TLASes whose tracing frame is now far enough behind to be off all in-flight queues. */
+    private void processDeferredTlasFrees() {
+        if (deferredTlas.isEmpty()) {
+            return;
+        }
+        java.util.Iterator<DeferredTlas> it = deferredTlas.iterator();
+        while (it.hasNext()) {
+            DeferredTlas d = it.next();
+            if (d.freeFrame() <= frameCounter) {
+                d.tlas().destroyAll();
+                it.remove();
+            }
+        }
+    }
+
     public void destroy() {
+        // Teardown runs after the device is idle (CLIENT_STOPPING waits), so any outstanding per-frame
+        // TLASes are no longer in flight and can be freed immediately.
+        for (DeferredTlas d : deferredTlas) {
+            d.tlas().destroyAll();
+        }
+        deferredTlas.clear();
         if (RtDlssRr.ENABLED) {
             RtDlssRr.INSTANCE.destroy();
         }
@@ -405,7 +447,6 @@ public final class RtComposite {
             }
             atlasSampler = 0L;
         }
-        boundWorldTlas = 0L;
     }
 
     private long atlasSampler(RtContext ctx) {

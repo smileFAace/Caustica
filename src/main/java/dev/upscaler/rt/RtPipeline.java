@@ -52,10 +52,12 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupH
  */
 public final class RtPipeline {
     private static final String SHADER_DIR = "/upscaler/rt/";
-    // A small ring of descriptor sets: setTlas writes the next slot (long-unused) rather than mutating
-    // the slot in-flight frames are still reading, so the TLAS can be swapped without a device drain.
-    // Swaps are many frames apart (one per async build), so even 2 would do; 3 is margin.
-    private static final int RING = 3;
+    // A ring of descriptor sets: setTlas writes the next slot (long-unused) rather than mutating the
+    // slot in-flight frames are still reading, so the TLAS can be swapped without a device drain.
+    // P5.1a rebuilds + rebinds the TLAS EVERY frame (dynamic content), so a slot is reused every RING
+    // frames; RING must exceed the max frames-in-flight (vanilla MC ≤ 3) for the reused slot to be off
+    // all queues. 6 gives margin and matches the KEEP_FRAMES-style horizon used for resource frees.
+    private static final int RING = 6;
 
     private final RtContext ctx;
     private final long descriptorSetLayout;

@@ -75,7 +75,11 @@ public final class RtTerrain {
     private final List<Deferred> deferred = new ArrayList<>(); // frames-in-flight-safe frees
     private Pending pending; // in-flight async geometry build, or null
     private RtBuffer sectionTable;
-    private RtAccel tlas;
+    // Static section instances (BLAS address + sectionOrigin-rebase transform, customIndex = list
+    // order = section-table index). Rebuilt on residency change; the per-frame TLAS in RtComposite
+    // merges these with dynamic (entity) instances. RtTerrain no longer owns the traced TLAS — it
+    // only builds the static section BLAS asynchronously and publishes the instance list + table.
+    private List<RtAccel.Instance> staticInstances;
     private boolean ready;
     // Rebase origin (player block at the last TLAS rebuild) for the instance transforms + ray camOffset.
     public int blockX;
@@ -85,13 +89,19 @@ public final class RtTerrain {
     private RtTerrain() {
     }
 
-    /** The manager if it currently has a built TLAS to trace, else null. */
+    /** The manager if it currently has resident geometry (built BLAS + instances) to trace, else null. */
     public static RtTerrain currentOrNull() {
         return INSTANCE.ready ? INSTANCE : null;
     }
 
-    public long tlas() {
-        return tlas.handle;
+    /**
+     * The static section instances to put in this frame's TLAS (BLAS address + sectionOrigin−rebase
+     * transform). {@code instanceCustomIndex} is the list position, which {@link RtAccel#prepareTlas}
+     * assigns and which the hit shaders use to index the section table. The list is stable between
+     * residency rebuilds, so the per-frame TLAS rebuild just re-references the same BLAS each frame.
+     */
+    public List<RtAccel.Instance> staticInstances() {
+        return staticInstances;
     }
 
     /** Section table device address: {@code {u64 primAddr, u64 idxAddr, u64 uvAddr}} per section, indexed by gl_InstanceCustomIndexEXT. */
@@ -326,15 +336,17 @@ public final class RtTerrain {
     private record Deferred(long freeFrame, Runnable free) {
     }
 
-    /** An in-flight async geometry build: the swap (new TLAS/table) lands when {@code op} completes. */
-    private record Pending(RtContext.AsyncSubmit op, RtAccel.PreparedBatch batch, RtBuffer newTable,
-                           List<SectionGeom> removed, int rbx, int rby, int rbz) {
+    /** An in-flight async BLAS build: the new section geometry/instances land when {@code op} completes. */
+    private record Pending(RtContext.AsyncSubmit op, List<RtAccel.PreparedBlas> blas, RtBuffer newTable,
+                           List<RtAccel.Instance> newInstances, List<SectionGeom> removed, int rbx, int rby, int rbz) {
     }
 
     /**
-     * Start an async geometry build. The new sections are added to residency and the new TLAS/table
-     * are built off the render thread; the old TLAS stays bound and traceable until {@link
-     * #finalizePending} swaps the result in. {@code rbx/rby/rbz} is the new rebase origin.
+     * Start an async geometry build. The new sections are added to residency and their BLAS are built
+     * off the render thread; the previously-published instance list + table stay live and traceable
+     * (against the old, already-built BLAS) until {@link #finalizePending} swaps the result in. The
+     * TLAS is no longer built here — {@link RtComposite} rebuilds it per frame from {@link
+     * #staticInstances()} plus dynamic instances. {@code rbx/rby/rbz} is the new rebase origin.
      */
     private void startBuild(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed, int rbx, int rby, int rbz) {
         for (PreparedSection ps : prepared) {
@@ -343,11 +355,11 @@ public final class RtTerrain {
 
         List<SectionGeom> ordered = new ArrayList<>(resident.values());
         if (ordered.isEmpty()) {
-            // Everything left the window: retire the current TLAS/table + removed sections, go not-ready.
+            // Everything left the window: retire the current table + removed sections, go not-ready.
             long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-            retire(freeAt, tlas, sectionTable, removed);
-            tlas = null;
+            retire(freeAt, sectionTable, removed);
             sectionTable = null;
+            staticInstances = null;
             ready = false;
             return;
         }
@@ -361,7 +373,9 @@ public final class RtTerrain {
             MemoryUtil.memPutLong(base, g.material.deviceAddress);
             MemoryUtil.memPutLong(base + 8, g.indices.deviceAddress);
             MemoryUtil.memPutLong(base + 16, g.uvs.deviceAddress);
-            // instanceCustomIndex == table index i (prepareTlas assigns it from the list order).
+            // instanceCustomIndex == table index i (prepareTlas assigns it from the list order). The
+            // BLAS device address is valid now even though its contents finish building async — the
+            // instance list is only published (and thus traced) once the build completes.
             float[] xform = {1, 0, 0, g.sx - rbx, 0, 1, 0, g.sy - rby, 0, 0, 1, g.sz - rbz};
             instances.add(new RtAccel.Instance(xform, g.blas.deviceAddress));
         }
@@ -370,21 +384,21 @@ public final class RtTerrain {
         for (PreparedSection ps : prepared) {
             blasBuilds.add(ps.blas());
         }
-        RtAccel.PreparedBatch batch = RtAccel.prepareBatch(ctx, blasBuilds, instances);
-        RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBatch(cmd, batch));
-        pending = new Pending(op, batch, newTable, removed, rbx, rby, rbz);
+        // BLAS-only async build (empty when this tick only freed sections — completes immediately).
+        RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBlasBuilds(cmd, blasBuilds));
+        pending = new Pending(op, blasBuilds, newTable, instances, removed, rbx, rby, rbz);
     }
 
-    /** Swap a completed async build in: retire old TLAS/table + removed sections, publish the new ones. */
+    /** Swap a completed async build in: retire old table + removed sections, publish the new instances/table. */
     private void finalizePending(RtContext ctx) {
         Pending p = pending;
         pending = null;
         ctx.freeAsync(p.op());
-        RtAccel.freeBatchScratch(p.batch()); // build done -> scratch + instance buffers safe to free
+        RtAccel.freeBlasScratch(p.blas()); // build done -> BLAS scratch safe to free
         long freeAt = RtComposite.frameCounter() + KEEP_FRAMES;
-        retire(freeAt, tlas, sectionTable, p.removed());
+        retire(freeAt, sectionTable, p.removed());
         sectionTable = p.newTable();
-        tlas = p.batch().tlas;
+        staticInstances = p.newInstances();
         blockX = p.rbx();
         blockY = p.rby();
         blockZ = p.rbz();
@@ -392,10 +406,7 @@ public final class RtTerrain {
     }
 
     /** Queue old GPU resources for a frames-in-flight-safe free at {@code freeFrame}. */
-    private void retire(long freeFrame, RtAccel oldTlas, RtBuffer oldTable, List<SectionGeom> removed) {
-        if (oldTlas != null) {
-            deferred.add(new Deferred(freeFrame, oldTlas::destroy));
-        }
+    private void retire(long freeFrame, RtBuffer oldTable, List<SectionGeom> removed) {
         if (oldTable != null) {
             deferred.add(new Deferred(freeFrame, oldTable::destroy));
         }
@@ -421,16 +432,18 @@ public final class RtTerrain {
 
     /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx) {
-        if (pending == null && resident.isEmpty() && tlas == null && sectionTable == null && deferred.isEmpty()) {
+        if (pending == null && resident.isEmpty() && sectionTable == null && deferred.isEmpty()) {
             empty.clear();
+            staticInstances = null;
             return;
         }
         ctx.waitIdle();
         if (pending != null) {
             ctx.freeAsync(pending.op());
-            RtAccel.freeBatchScratch(pending.batch());
+            RtAccel.freeBlasScratch(pending.blas());
             pending.newTable().destroy();
-            pending.batch().tlas.destroy();
+            // The new sections' BLAS were added to `resident` in startBuild, so resident's destroy
+            // below frees them; only the removed (already out of resident) need freeing here.
             for (SectionGeom g : pending.removed()) {
                 g.destroy();
             }
@@ -440,10 +453,6 @@ public final class RtTerrain {
             d.free().run();
         }
         deferred.clear();
-        if (tlas != null) {
-            tlas.destroy();
-            tlas = null;
-        }
         if (sectionTable != null) {
             sectionTable.destroy();
             sectionTable = null;
@@ -453,6 +462,7 @@ public final class RtTerrain {
         }
         resident.clear();
         empty.clear();
+        staticInstances = null;
         ready = false;
     }
 

@@ -13,14 +13,10 @@ import org.lwjgl.vulkan.VkAccelerationStructureGeometryKHR;
 import org.lwjgl.vulkan.VkAccelerationStructureInstanceKHR;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkDevice;
-import org.lwjgl.vulkan.VkMemoryBarrier;
 
 import java.util.List;
 
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR;
-import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
@@ -68,18 +64,6 @@ public final class RtAccel {
     }
 
     /**
-     * Build a single bottom-level AS over an indexed triangle mesh. Convenience wrapper around
-     * {@link #prepareTrianglesBlas} + {@link #buildPrepared} for one-off builds (e.g. the triangle
-     * spike). For per-frame terrain, prepare many and {@link #buildPrepared} them in one submission.
-     */
-    public static RtAccel buildTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
-                                             RtBuffer indices, int indexCount, boolean opaque) {
-        PreparedBlas prepared = prepareTrianglesBlas(ctx, positions, vertexCount, indices, indexCount, opaque);
-        buildPrepared(ctx, java.util.List.of(prepared));
-        return prepared.accel;
-    }
-
-    /**
      * A BLAS whose AS + backing buffer are allocated but whose build command is recorded later, so
      * many sections' builds can be batched into one submission — one {@code vkQueueSubmit} + fence
      * wait per tick instead of one per section (each submit drains the graphics queue, so per-section
@@ -107,7 +91,7 @@ public final class RtAccel {
         }
     }
 
-    /** Allocate a BLAS (AS + backing + scratch) and query sizes, but defer the build to {@link #buildPrepared}. */
+    /** Allocate a BLAS (AS + backing + scratch) and query sizes, but defer the build to {@link #recordBlasBuilds}. */
     public static PreparedBlas prepareTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                     RtBuffer indices, int indexCount, boolean opaque) {
         VkDevice vk = ctx.vk();
@@ -135,24 +119,6 @@ public final class RtAccel {
             long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
             RtAccel accel = new RtAccel(vk, handle, deviceAddress, backing);
             return new PreparedBlas(accel, scratch, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque);
-        }
-    }
-
-    /** Record every prepared BLAS build into one command buffer and submit once, then free scratch. */
-    public static void buildPrepared(RtContext ctx, List<PreparedBlas> prepared) {
-        if (prepared.isEmpty()) {
-            return;
-        }
-        ctx.submitSync(cmd -> {
-            for (PreparedBlas b : prepared) {
-                // Per-iteration stack frame: hundreds of builds on one frame would overflow the 64 KB stack.
-                try (MemoryStack stack = MemoryStack.stackPush()) {
-                    recordBlasBuild(cmd, stack, b); // independent builds (own dst AS + scratch), no barriers needed
-                }
-            }
-        });
-        for (PreparedBlas b : prepared) {
-            b.scratch.destroy();
         }
     }
 
@@ -185,6 +151,17 @@ public final class RtAccel {
             this.instanceBuffer = instanceBuffer;
             this.scratch = scratch;
             this.instanceCount = instanceCount;
+        }
+
+        /**
+         * Free the TLAS, its instance buffer, and its scratch. For a per-frame TLAS the whole bundle
+         * is retired together once the frame that traced it is no longer in flight (the instance +
+         * scratch buffers are still read by the recorded build, and the AS by the recorded trace).
+         */
+        public void destroyAll() {
+            accel.destroy();
+            instanceBuffer.destroy();
+            scratch.destroy();
         }
     }
 
@@ -242,48 +219,30 @@ public final class RtAccel {
         return build;
     }
 
-    /** Build a top-level AS from instances (convenience: no new BLAS in the same submission). */
-    public static RtAccel buildTlas(RtContext ctx, List<Instance> instances) {
-        return buildBatch(ctx, List.of(), instances);
-    }
-
-    /** A batched geometry update (new BLAS + a TLAS), allocated and ready to record into a command buffer. */
-    public static final class PreparedBatch {
-        public final RtAccel tlas;
-        private final List<PreparedBlas> blas;
-        private final PreparedTlas preparedTlas;
-
-        private PreparedBatch(List<PreparedBlas> blas, PreparedTlas preparedTlas) {
-            this.tlas = preparedTlas.accel;
-            this.blas = blas;
-            this.preparedTlas = preparedTlas;
-        }
-    }
-
-    /** Allocate a batch: prepare the TLAS (the BLAS are already prepared); records/builds happen later. */
-    public static PreparedBatch prepareBatch(RtContext ctx, List<PreparedBlas> blasToBuild, List<Instance> instances) {
-        return new PreparedBatch(blasToBuild, prepareTlas(ctx, instances));
-    }
-
-    /**
-     * Record a batch into a command buffer: every BLAS build, an acceleration-structure barrier
-     * (the TLAS reads the BLAS the builds just wrote), then the TLAS build.
-     */
-    public static void recordBatch(VkCommandBuffer cmd, PreparedBatch batch) {
-        for (PreparedBlas b : batch.blas) {
+    /** Record every prepared BLAS build into the command buffer (independent builds, no barriers between them). */
+    public static void recordBlasBuilds(VkCommandBuffer cmd, List<PreparedBlas> blas) {
+        for (PreparedBlas b : blas) {
             try (MemoryStack stack = MemoryStack.stackPush()) { // per-iteration: avoid 64 KB stack overflow
                 recordBlasBuild(cmd, stack, b);
             }
         }
+    }
+
+    /** Free the transient scratch buffers of a set of prepared BLAS (only after their build completed). */
+    public static void freeBlasScratch(List<PreparedBlas> blas) {
+        for (PreparedBlas b : blas) {
+            b.scratch.destroy();
+        }
+    }
+
+    /**
+     * Record a single TLAS build into the command buffer. The caller is responsible for the AS-build →
+     * ray-trace barrier before tracing (and, when BLAS are built in the same submission, the
+     * BLAS-write → AS-read barrier before this). Drives the per-frame TLAS rebuild in {@link
+     * RtComposite} that merges static terrain instances with dynamic ones.
+     */
+    public static void recordTlasBuild(VkCommandBuffer cmd, PreparedTlas tlas) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            if (!batch.blas.isEmpty()) {
-                VkMemoryBarrier.Buffer bar = VkMemoryBarrier.calloc(1, stack).sType$Default()
-                        .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
-                        .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
-                VK10.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, bar, null, null);
-            }
-            PreparedTlas tlas = batch.preparedTlas;
             VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
             build.get(0).dstAccelerationStructure(tlas.accel.handle);
             build.get(0).scratchData().deviceAddress(tlas.scratch.deviceAddress);
@@ -292,26 +251,6 @@ public final class RtAccel {
             PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
             vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
         }
-    }
-
-    /** Free a batch's transient scratch + instance buffers (only after the build has completed). */
-    public static void freeBatchScratch(PreparedBatch batch) {
-        for (PreparedBlas b : batch.blas) {
-            b.scratch.destroy();
-        }
-        batch.preparedTlas.scratch.destroy();
-        batch.preparedTlas.instanceBuffer.destroy();
-    }
-
-    /**
-     * Build a batch synchronously (one {@code submitSync} → one queue drain). The async path uses
-     * {@link #prepareBatch} + {@link #recordBatch} + {@link #freeBatchScratch} via {@code submitAsync}.
-     */
-    public static RtAccel buildBatch(RtContext ctx, List<PreparedBlas> blasToBuild, List<Instance> instances) {
-        PreparedBatch batch = prepareBatch(ctx, blasToBuild, instances);
-        ctx.submitSync(cmd -> recordBatch(cmd, batch));
-        freeBatchScratch(batch);
-        return batch.tlas;
     }
 
     private static void recordBlasBuild(VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {

@@ -260,11 +260,20 @@ to fill our own buffers — we do not consume its packed/culled render output.)
   the FSR/DLSS-SR rasterizer paths were removed; the SVGF/NRD/FSR/XeSS vendor-agnostic fallback in
   step 5 above is deferred to the end of the project. Exposure: AutoExposure (fixed-exposure A/B is a
   P-final tuning item). Goal met: clean real-time image at ~1/4 the ray work.
-- **P5 — Dynamic content.** ← next. Entity/block-entity geometry as **rigid cuboid instances**
+- **P5 — Dynamic content.** ← in progress. Entity/block-entity geometry as **rigid cuboid instances**
   (`ModelPart` boxes are rigid, not skinned — instance a unit-cube BLAS per part, or
   refit a per-entity BLAS only on pose change; cheap even with many mobs) + per-frame
   motion vectors (owned, so MV is clean); water/translucency (refraction); foliage
   alpha-test via native **any-hit**.
+  - **P5.1a — dynamic per-frame TLAS plumbing (in working tree; compiles; NOT yet GPU-verified).**
+    The traced TLAS moved out of `RtTerrain` (which still builds the section BLAS async) into a
+    **per-frame rebuild recorded inline in the composite's frame command buffer**: `RtTerrain` now
+    publishes a static-instance list (`staticInstances()`) + the section table; `RtComposite` each
+    frame does `prepareTlas(staticInstances)` → `setTlas` → `recordTlasBuild` → AS-build→trace barrier
+    → trace, retiring the frame TLAS `KEEP_FRAMES` later via a deferred-free queue. The descriptor ring
+    grew to 6 (per-frame rebind cycles a slot every frame; must exceed frames-in-flight). De-risking
+    milestone: **terrain image unchanged, no leaks/corruption flying around** — the foundation entities
+    (P5.1b) and per-object MVs (P5.1c) build on.
 - **P6 — PBR materials.** LabPBR resource-pack ingestion (normal/roughness/metallic/
   emissive/SSS) + proper BRDF. Heuristic fallback when no PBR pack.
 - **P7 — Perf & polish.** AS compaction, SER tuning, texture-LOD via ray cones,
