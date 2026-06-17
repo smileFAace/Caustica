@@ -121,16 +121,25 @@ public final class RtTerrain {
     }
 
     /**
-     * Mark every section overlapping a dirty block area for re-extraction. Fed by the LevelExtractor
-     * hook (vanilla's block-change signal). Thread-safe; drained on the next {@link #tick}.
+     * Mark every section overlapping a dirty block area — <em>plus the bordering neighbour sections</em>
+     * — for re-extraction. Fed by the LevelExtractor hook (vanilla's block-change signal). Thread-safe;
+     * drained on the next {@link #tick}.
+     *
+     * <p>The block area is expanded by one block on every side before mapping to sections, matching
+     * vanilla's own dirty expansion. A change touching a section edge therefore also re-extracts the
+     * adjacent section: that neighbour's cull faces toward the change (a broken block uncovers a face)
+     * and, for fluids, its shared-edge surface heights (the top-face corner heights are averaged from
+     * the blocks straddling the section boundary) both depend on the edited block. Without re-extracting
+     * it the neighbour keeps stale geometry — opaque holes and a disconnected water surface at the seam.
+     * Interior edits stay within one section (±1 doesn't cross a 16-block boundary).
      */
     public static void markBlocksDirty(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
         if (!ENABLED) {
             return;
         }
-        for (int scx = minX >> 4; scx <= maxX >> 4; scx++) {
-            for (int scy = minY >> 4; scy <= maxY >> 4; scy++) {
-                for (int scz = minZ >> 4; scz <= maxZ >> 4; scz++) {
+        for (int scx = (minX - 1) >> 4; scx <= (maxX + 1) >> 4; scx++) {
+            for (int scy = (minY - 1) >> 4; scy <= (maxY + 1) >> 4; scy++) {
+                for (int scz = (minZ - 1) >> 4; scz <= (maxZ + 1) >> 4; scz++) {
                     INSTANCE.dirty.add(sectionKey(scx, scy, scz));
                 }
             }
@@ -192,7 +201,8 @@ public final class RtTerrain {
                 for (int scy = loY; scy <= hiY; scy++) {
                     long key = sectionKey(scx, scy, scz);
                     desired.add(key);
-                    if (!resident.containsKey(key) && !empty.contains(key)) {
+                    if (!resident.containsKey(key) && !empty.contains(key)
+                            && neighborChunksReady(level, scx, scz, pcx, pcz, r)) {
                         missing.add(new int[]{scx, scy, scz});
                     }
                 }
@@ -244,6 +254,33 @@ public final class RtTerrain {
         if (!removed.isEmpty() || !prepared.isEmpty()) {
             startBuild(ctx, prepared, removed, pb.getX(), pb.getY(), pb.getZ());
         }
+    }
+
+    /**
+     * Whether a section may be built now: all of its eight horizontal neighbour chunks that fall
+     * <em>within the RT view window</em> are loaded. We extract using vanilla's model/fluid renderers,
+     * which read across chunk borders for cull faces and (for fluids) the surrounding blocks that set
+     * a water surface's edge/corner heights. If a border section is built while its neighbour chunk is
+     * still missing, those reads return air — the neighbour-facing faces and the shared water surface
+     * come out wrong, and nothing re-dirties the section once the chunk arrives (a bulk chunk load
+     * fires no per-block update). Deferring the build until the neighbours are present makes the first
+     * build correct. Out-of-window neighbours are ignored: they aren't ray-traced, so there is no
+     * visible seam against them, and waiting on them would leave a permanent hole at the view edge.
+     */
+    private boolean neighborChunksReady(ClientLevel level, int scx, int scz, int pcx, int pcz, int r) {
+        for (int dx = -1; dx <= 1; dx++) {
+            for (int dz = -1; dz <= 1; dz++) {
+                if (dx == 0 && dz == 0) {
+                    continue;
+                }
+                int ncx = scx + dx, ncz = scz + dz;
+                boolean inWindow = Math.abs(ncx - pcx) <= r && Math.abs(ncz - pcz) <= r;
+                if (inWindow && !level.getChunkSource().hasChunk(ncx, ncz)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     private int horizontalChunks(Minecraft mc) {
