@@ -294,6 +294,16 @@ to fill our own buffers — we do not consume its packed/culled render output.)
     objDisp)`; `objDisp` = 0 for static terrain/sky → the validated camera-only MV is unchanged). New
     push field `entityTableAddr@184` (WORLD_PUSH 184→192). Exact for the rigid boxes; for animated
     models (P5.1b-2) it's the rigid-body approximation (limb motion is unmodeled) — fine for DLSS-RR.
+  - **P5.1b-2 — real model capture (staged).** Replaces the AABB boxes with actual `ModelPart` mob
+    geometry via a capturing `SubmitNodeCollector` (`submitModel` → `setupAnim` + `renderToBuffer` into
+    an `RtEntityCapture` VertexConsumer; the rest no-op). **Step 1 (in working tree; compiles; NOT
+    committed; no GPU geometry yet):** the capture infra (`RtEntityCapture`, `RtEntityCollector`) + a
+    gated/throttled verification probe (`RtEntities.probe`, `-Dupscaler.rt.entityProbe`) that extracts +
+    submits each entity and logs captured vert/tri counts + bounds — de-risking the dispatcher/collector
+    integration before the GPU rework. **Step 2:** per-frame per-entity BLAS (recordFrame surgery) + an
+    entity geometry table so the chit reads real per-triangle normals (replacing the box face-normal
+    path). **P5.1b-2b:** entity textures (per-type files → bindless/texture-array; flat vertex-colour
+    until then).
 - **P6 — PBR materials.** LabPBR resource-pack ingestion (normal/roughness/metallic/
   emissive/SSS) + proper BRDF. Heuristic fallback when no PBR pack.
 - **P7 — Perf & polish.** AS compaction, SER tuning, texture-LOD via ray cones,

@@ -1,10 +1,17 @@
 package dev.upscaler.rt;
 
+import com.mojang.blaze3d.vertex.PoseStack;
+import dev.upscaler.UpscalerMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.entity.EntityRenderDispatcher;
+import net.minecraft.client.renderer.entity.state.EntityRenderState;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
@@ -57,12 +64,89 @@ public final class RtEntities {
     // entities that left). New/unseen entities get zero displacement (no ghost-correction artifact).
     private Map<Integer, float[]> prevPositions = new HashMap<>();
 
+    // P5.1b-2 step 1: capture-pipeline verification probe (no GPU geometry yet). Gated + throttled; it
+    // extracts + submits each entity through the capturing collector and logs vert/tri counts + bounds,
+    // proving the dispatcher/collector/capture path produces sane meshes before the GPU-side rework.
+    public static final boolean ENABLED_PROBE = Boolean.parseBoolean(System.getProperty("upscaler.rt.entityProbe", "false"));
+    private static final int PROBE_INTERVAL = 120; // composites between probe logs
+    private long probeCounter;
+    private RtEntityCollector probeCollector;
+    private RtEntityCapture probeCapture;
+    private CameraRenderState probeCamera;
+
     private RtEntities() {
     }
 
     /** Device address of this frame's entity displacement table (valid whenever entity instances exist). */
     public long entityTableAddress() {
         return entityTableAddr;
+    }
+
+    /**
+     * P5.1b-2 step-1 verification probe: extract + submit each entity through the capturing collector
+     * and log the captured geometry stats. Does NOT touch the GPU or the box render path — it only
+     * proves the capture pipeline works. Gated by {@code -Dupscaler.rt.entityProbe}; throttled.
+     */
+    public void probe(double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
+        if (!ENABLED_PROBE || (probeCounter++ % PROBE_INTERVAL) != 0) {
+            return;
+        }
+        Minecraft mc = Minecraft.getInstance();
+        ClientLevel level = mc.level;
+        if (level == null) {
+            return;
+        }
+        EntityRenderDispatcher dispatcher = mc.getEntityRenderDispatcher();
+        float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+        Entity cameraEntity = mc.getCameraEntity();
+        if (probeCamera == null) {
+            probeCamera = new CameraRenderState();
+            probeCollector = new RtEntityCollector();
+            probeCapture = new RtEntityCapture();
+        }
+        // Minimal camera render state: enough for body geometry (name tags / billboards are no-op'd).
+        probeCamera.pos = new Vec3(camX, camY, camZ);
+        probeCamera.projectionMatrix.set(projection);
+        probeCamera.viewRotationMatrix.set(viewRotation);
+        probeCamera.orientation.setFromUnnormalized(viewRotation);
+        probeCamera.initialized = true;
+
+        int total = 0, captured = 0, totalTris = 0, logged = 0, failed = 0;
+        StringBuilder sample = new StringBuilder();
+        for (Entity entity : level.entitiesForRendering()) {
+            if (entity == cameraEntity || entity.isInvisible()) {
+                continue;
+            }
+            total++;
+            try {
+                EntityRenderState state = dispatcher.extractEntity(entity, partial);
+                PoseStack pose = new PoseStack();
+                probeCapture.reset();
+                probeCollector.begin(probeCapture);
+                double x = Mth.lerp(partial, entity.xo, entity.getX()) - camX;
+                double y = Mth.lerp(partial, entity.yo, entity.getY()) - camY;
+                double z = Mth.lerp(partial, entity.zo, entity.getZ()) - camZ;
+                dispatcher.submit(state, probeCamera, x, y, z, pose, probeCollector);
+                if (!probeCapture.isEmpty()) {
+                    captured++;
+                    totalTris += probeCapture.triangleCount();
+                    if (logged < 5) {
+                        sample.append(String.format("  %s: %d verts, %d tris, bbox=[%.2f,%.2f,%.2f .. %.2f,%.2f,%.2f]%n",
+                                entity.getType(), probeCapture.vertexCount(), probeCapture.triangleCount(),
+                                probeCapture.minX, probeCapture.minY, probeCapture.minZ,
+                                probeCapture.maxX, probeCapture.maxY, probeCapture.maxZ));
+                        logged++;
+                    }
+                }
+            } catch (Throwable t) {
+                failed++;
+                if (failed <= 2) {
+                    UpscalerMod.LOGGER.warn("RT entity capture probe failed for {}", entity.getType(), t);
+                }
+            }
+        }
+        UpscalerMod.LOGGER.info("RT entity capture probe: {} entities, {} captured, {} tris total, {} failed{}{}",
+                total, captured, totalTris, failed, sample.length() > 0 ? "\n" : "", sample);
     }
 
     /**

@@ -354,6 +354,8 @@ public final class RtComposite {
             // The section BLAS are already built (async, by RtTerrain) and the entity cube BLAS is built
             // once; only the cheap instance-level TLAS is rebuilt per frame. Retired KEEP_FRAMES later,
             // once this frame is no longer in flight.
+            // P5.1b-2 step 1: throttled capture-pipeline probe (no-op unless -Dupscaler.rt.entityProbe).
+            RtEntities.INSTANCE.probe(camX, camY, camZ, frameProjection, frameViewRotation);
             var instances = RtEntities.INSTANCE.withEntities(ctx, terrain.staticInstances(),
                     terrain.blockX, terrain.blockY, terrain.blockZ);
             // P5.1c: the entity displacement table this frame's entity hits read for per-object MVs
