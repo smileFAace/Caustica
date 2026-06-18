@@ -146,7 +146,7 @@ public final class RtContext {
             long handle = pBuf.get(0);
             VkBufferDeviceAddressInfo bdai = VkBufferDeviceAddressInfo.calloc(stack).sType$Default().buffer(handle);
             long address = VK12.vkGetBufferDeviceAddress(vk, bdai);
-            return new RtBuffer(vma, handle, pAlloc.get(0), address, hostVisible ? info.pMappedData() : 0L);
+            return new RtBuffer(vma, handle, pAlloc.get(0), address, hostVisible ? info.pMappedData() : 0L, size, usage, hostVisible);
         }
     }
 

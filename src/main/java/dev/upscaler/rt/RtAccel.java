@@ -42,14 +42,20 @@ public final class RtAccel {
     public final long deviceAddress;
 
     private final RtBuffer backing;
+    private final boolean ownsBacking;
     private final VkDevice vk;
     private boolean destroyed;
 
     private RtAccel(VkDevice vk, long handle, long deviceAddress, RtBuffer backing) {
+        this(vk, handle, deviceAddress, backing, true);
+    }
+
+    private RtAccel(VkDevice vk, long handle, long deviceAddress, RtBuffer backing, boolean ownsBacking) {
         this.vk = vk;
         this.handle = handle;
         this.deviceAddress = deviceAddress;
         this.backing = backing;
+        this.ownsBacking = ownsBacking;
     }
 
     public void destroy() {
@@ -59,7 +65,10 @@ public final class RtAccel {
         if (handle != 0L) {
             vkDestroyAccelerationStructureKHR(vk, handle, null);
         }
-        backing.destroy();
+        // A pooled BLAS's backing is owned by RtBufferPool (recycled, not destroyed here).
+        if (ownsBacking) {
+            backing.destroy();
+        }
         destroyed = true;
     }
 
@@ -74,15 +83,19 @@ public final class RtAccel {
     public static final class PreparedBlas {
         public final RtAccel accel;
         private final RtBuffer scratch;
+        // Non-null only for a pooled BLAS (see prepareTrianglesBlasPooled): the AS backing buffer, owned
+        // by RtBufferPool, so releaseBlasToPool can return it rather than destroying it.
+        private final RtBuffer pooledBacking;
         private final long vertexAddr;
         private final long indexAddr;
         private final int maxVertex;
         private final int triangleCount;
         private final boolean opaque;
 
-        private PreparedBlas(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr, int maxVertex, int triangleCount, boolean opaque) {
+        private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer pooledBacking, long vertexAddr, long indexAddr, int maxVertex, int triangleCount, boolean opaque) {
             this.accel = accel;
             this.scratch = scratch;
+            this.pooledBacking = pooledBacking;
             this.vertexAddr = vertexAddr;
             this.indexAddr = indexAddr;
             this.maxVertex = maxVertex;
@@ -96,30 +109,64 @@ public final class RtAccel {
                                                     RtBuffer indices, int indexCount, boolean opaque) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, positions.deviceAddress,
-                    indices.deviceAddress, vertexCount, opaque);
-            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
-            build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
-                    .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
-                    .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(1).pGeometries(geom);
-
-            VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
-            vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                    build.get(0), stack.ints(indexCount / 3), sizes);
-
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque);
             RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
-            VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
-                    .buffer(backing.handle).offset(0).size(sizes.accelerationStructureSize()).type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
-            java.nio.LongBuffer pAs = stack.mallocLong(1);
-            RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
-            long handle = pAs.get(0);
             RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
-            VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
-                    .sType$Default().accelerationStructure(handle);
-            long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
-            RtAccel accel = new RtAccel(vk, handle, deviceAddress, backing);
-            return new PreparedBlas(accel, scratch, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque);
+            RtAccel accel = createBlasOn(vk, stack, backing, sizes.accelerationStructureSize(), true);
+            return new PreparedBlas(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque);
         }
+    }
+
+    /**
+     * Pooled variant of {@link #prepareTrianglesBlas} for the per-frame entity path: the AS backing +
+     * scratch buffers come from {@code pool} (recycled, not freshly allocated). The BLAS is reclaimed with
+     * {@link #releaseBlasToPool} (NOT {@code freeBlasScratch} + {@code accel.destroy()}). Used only by
+     * {@link RtEntities}; the terrain path keeps {@link #prepareTrianglesBlas}.
+     */
+    public static PreparedBlas prepareTrianglesBlasPooled(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
+                                                          RtBuffer indices, int indexCount, boolean opaque) {
+        VkDevice vk = ctx.vk();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque);
+            // acquire() returns capacity ≥ requested size; the AS is created with the exact queried size.
+            RtBuffer backing = pool.acquire(ctx, sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
+            RtBuffer scratch = pool.acquire(ctx, sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+            RtAccel accel = createBlasOn(vk, stack, backing, sizes.accelerationStructureSize(), false);
+            return new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque);
+        }
+    }
+
+    /** Reclaim a pooled BLAS: destroy its AS handle and return its backing + scratch buffers to the pool. */
+    public static void releaseBlasToPool(RtBufferPool pool, PreparedBlas blas) {
+        blas.accel.destroy(); // ownsBacking == false → destroys only the AS handle, not the backing buffer
+        pool.release(blas.pooledBacking);
+        pool.release(blas.scratch);
+    }
+
+    private static VkAccelerationStructureBuildSizesInfoKHR queryBlasSizes(VkDevice vk, MemoryStack stack, RtBuffer positions,
+                                                                           RtBuffer indices, int vertexCount, int indexCount, boolean opaque) {
+        VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, positions.deviceAddress,
+                indices.deviceAddress, vertexCount, opaque);
+        VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
+        build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR)
+                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+                .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(1).pGeometries(geom);
+        VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
+        vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                build.get(0), stack.ints(indexCount / 3), sizes);
+        return sizes;
+    }
+
+    private static RtAccel createBlasOn(VkDevice vk, MemoryStack stack, RtBuffer backing, long accelSize, boolean ownsBacking) {
+        VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
+                .buffer(backing.handle).offset(0).size(accelSize).type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+        java.nio.LongBuffer pAs = stack.mallocLong(1);
+        RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
+        long handle = pAs.get(0);
+        VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
+                .sType$Default().accelerationStructure(handle);
+        long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
+        return new RtAccel(vk, handle, deviceAddress, backing, ownsBacking);
     }
 
     private static VkAccelerationStructureGeometryKHR.Buffer triangleGeometry(MemoryStack stack, long vertexAddr, long indexAddr, int vertexCount, boolean opaque) {

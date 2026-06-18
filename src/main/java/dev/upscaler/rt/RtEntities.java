@@ -1,7 +1,6 @@
 package dev.upscaler.rt;
 
 import com.mojang.blaze3d.vertex.PoseStack;
-import dev.upscaler.UpscalerMod;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.blockentity.BlockEntityRenderDispatcher;
@@ -68,17 +67,16 @@ public final class RtEntities {
     private RtBuffer[] tableRing;
     private int tableSlot;
 
+    // P5-perf #1 (step 1): recycle per-frame entity mesh buffers + BLAS backing/scratch instead of
+    // alloc/free churning ~6 VMA buffers per entity per frame. See RtBufferPool.
+    private final RtBufferPool pool = new RtBufferPool();
+
     // Previous frame's absolute interpolated positions, keyed by entity id (rebuilt each frame → prunes
     // entities that left view); drives the per-object motion-vector displacement.
     private Map<Integer, float[]> prevPositions = new HashMap<>();
 
     // Per-frame entity GPU resources awaiting a frames-in-flight-safe free.
     private final List<Deferred> deferred = new ArrayList<>();
-
-    // P5.1b-2 step-1 capture-pipeline probe (kept; gated + throttled).
-    public static final boolean ENABLED_PROBE = Boolean.parseBoolean(System.getProperty("upscaler.rt.entityProbe", "false"));
-    private static final int PROBE_INTERVAL = 120;
-    private long probeCounter;
 
     private RtEntities() {
     }
@@ -119,6 +117,7 @@ public final class RtEntities {
     public FrameEntities beginFrame(RtContext ctx, List<RtAccel.Instance> base, int rbx, int rby, int rbz,
                                     double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
         processDeferred();
+        pool.maybeLogStats();
         if (!ENABLED) {
             return new FrameEntities(base, List.of(), 0L);
         }
@@ -143,12 +142,13 @@ public final class RtEntities {
         List<RtAccel.PreparedBlas> blasForFree = build.blas;
         List<RtBuffer> buffersForFree = build.buffers;
         deferred.add(new Deferred(freeAt, () -> {
-            RtAccel.freeBlasScratch(blasForFree);
+            // Recycle (don't destroy): the deferred horizon guarantees these are off all queues, so the
+            // pool can hand them straight back to the next frame's appendCapture.
             for (RtAccel.PreparedBlas b : blasForFree) {
-                b.accel.destroy();
+                RtAccel.releaseBlasToPool(pool, b);
             }
             for (RtBuffer buf : buffersForFree) {
-                buf.destroy();
+                pool.release(buf);
             }
         }));
         return new FrameEntities(build.instances, build.blas, build.geomTableAddr);
@@ -251,17 +251,19 @@ public final class RtEntities {
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
-        RtBuffer positions = ctx.createBuffer((long) capture.verts.size() * Float.BYTES, asInput, true);
-        RtBuffer indices = ctx.createBuffer((long) capture.idx.size() * Integer.BYTES, asInput | storage, true);
-        RtBuffer uvs = ctx.createBuffer((long) capture.uvList.size() * Float.BYTES, storage, true);
-        RtBuffer prim = ctx.createBuffer((long) capture.prim.size() * Float.BYTES, storage, true);
+        // Pooled: acquire returns capacity ≥ requested (power-of-two bucket); we write only the exact
+        // prefix and pass exact counts to the BLAS/geom-table, so the unused tail is harmless.
+        RtBuffer positions = pool.acquire(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true);
+        RtBuffer indices = pool.acquire(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true);
+        RtBuffer uvs = pool.acquire(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true);
+        RtBuffer prim = pool.acquire(ctx, (long) capture.prim.size() * Float.BYTES, storage, true);
         MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
         MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
         MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
         MemoryUtil.memFloatBuffer(prim.mapped, capture.prim.size()).put(capture.prim.elements(), 0, capture.prim.size());
 
         // Non-opaque so world.rahit alpha-tests the texture (cutout). Opaque texels pass to the chit.
-        RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false);
+        RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlasPooled(ctx, pool, positions, vertCount, indices, idxCount, false);
 
         long entry = build.tableBase + (long) build.count * TABLE_ENTRY_BYTES;
         MemoryUtil.memPutLong(entry, prim.deviceAddress);
@@ -320,10 +322,13 @@ public final class RtEntities {
 
     /** Free the geometry-table ring + any outstanding per-frame entity resources (teardown; GPU idle). */
     public void shutdown() {
+        // Drain outstanding deferred releases first (they return buffers/AS to the pool), then destroy
+        // the pool itself. Runs after waitIdle, so immediate destruction is safe.
         for (Deferred d : deferred) {
             d.free().run();
         }
         deferred.clear();
+        pool.destroyAll();
         if (tableRing != null) {
             for (RtBuffer b : tableRing) {
                 b.destroy();
@@ -331,63 +336,5 @@ public final class RtEntities {
             tableRing = null;
         }
         prevPositions.clear();
-    }
-
-    /**
-     * P5.1b-2 step-1 verification probe: extract + submit each entity through the capturing collector
-     * and log the captured geometry stats. Pure diagnostic (no GPU). Gated by {@code
-     * -Dupscaler.rt.entityProbe}; throttled.
-     */
-    public void probe(double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
-        if (!ENABLED_PROBE || (probeCounter++ % PROBE_INTERVAL) != 0) {
-            return;
-        }
-        Minecraft mc = Minecraft.getInstance();
-        ClientLevel level = mc.level;
-        if (level == null) {
-            return;
-        }
-        EntityRenderDispatcher dispatcher = mc.getEntityRenderDispatcher();
-        float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
-        Entity cameraEntity = mc.getCameraEntity();
-        setCamera(camX, camY, camZ, projection, viewRotation);
-
-        int total = 0, captured = 0, totalTris = 0, logged = 0, failed = 0;
-        StringBuilder sample = new StringBuilder();
-        for (Entity entity : level.entitiesForRendering()) {
-            if (entity == cameraEntity || entity.isInvisible()) {
-                continue;
-            }
-            total++;
-            try {
-                EntityRenderState state = dispatcher.extractEntity(entity, partial);
-                PoseStack pose = new PoseStack();
-                capture.reset();
-                collector.begin(capture);
-                double x = Mth.lerp(partial, entity.xo, entity.getX()) - camX;
-                double y = Mth.lerp(partial, entity.yo, entity.getY()) - camY;
-                double z = Mth.lerp(partial, entity.zo, entity.getZ()) - camZ;
-                dispatcher.submit(state, cameraState, x, y, z, pose, collector);
-                if (!capture.isEmpty()) {
-                    captured++;
-                    totalTris += capture.triangleCount();
-                    if (logged < 5) {
-                        long texView = RtEntityTextures.INSTANCE.resolveView(collector.firstRenderType());
-                        sample.append(String.format("  %s: %d verts, %d tris, tex=0x%x%n",
-                                entity.getType(), capture.vertexCount(), capture.triangleCount(), texView));
-                        logged++;
-                    }
-                }
-            } catch (Throwable t) {
-                failed++;
-                if (failed <= 2) {
-                    UpscalerMod.LOGGER.warn("RT entity capture probe failed for {}", entity.getType(), t);
-                }
-            } finally {
-                collector.begin(null);
-            }
-        }
-        UpscalerMod.LOGGER.info("RT entity capture probe: {} entities, {} captured, {} tris total, {} failed{}{}",
-                total, captured, totalTris, failed, sample.length() > 0 ? "\n" : "", sample);
     }
 }

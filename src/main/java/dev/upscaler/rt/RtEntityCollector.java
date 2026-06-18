@@ -43,25 +43,18 @@ import java.util.List;
  * custom geometry, particles, gizmos) is a no-op — the entity *body geometry* is what we want for RT;
  * held items / custom geometry are not captured yet (acceptable, noted for P5.1b-2b).
  *
- * <p>Driven once per entity per probe/frame: {@link #begin} sets the capture, then {@code
+ * <p>Driven once per entity per frame: {@link #begin} sets the capture, then {@code
  * EntityRenderDispatcher.submit} fans out into {@code submitModel} here. Reused across entities.
  */
 public final class RtEntityCollector implements SubmitNodeCollector {
     private static final Direction[] DIRECTIONS = Direction.values();
 
     private RtEntityCapture capture;
-    private RenderType firstRenderType; // P5.1b-2b: the entity's primary (body) render type → texture
     private ModelBlockRenderer blockRenderer; // P5.1b-2e: lazily-built mesher for moving (falling) blocks
 
     /** Point the collector at the capture buffer for the next {@code dispatcher.submit}. */
     public void begin(RtEntityCapture capture) {
         this.capture = capture;
-        this.firstRenderType = null;
-    }
-
-    /** The first render type submitted this capture (the body), used to resolve the entity texture. */
-    public RenderType firstRenderType() {
-        return firstRenderType;
     }
 
     @Override
@@ -70,9 +63,6 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                                 int outlineColor, ModelFeatureRenderer.CrumblingOverlay crumblingOverlay) {
         if (capture == null) {
             return;
-        }
-        if (firstRenderType == null) {
-            firstRenderType = renderType;
         }
         // Resolve this submission's texture to a bindless slot; the capture stamps it on every prim.
         // Block-entity models (chests/signs/beds) texture from an atlas SPRITE: use that atlas + remap

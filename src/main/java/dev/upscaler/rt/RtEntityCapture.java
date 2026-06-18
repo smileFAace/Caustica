@@ -17,8 +17,7 @@ import org.joml.Vector3fc;
  * <p>The accumulators use the SAME layout as terrain's {@code SectionMesh} (positions, indices, atlas
  * UV, per-prim {@code {normal.xyz, emission}, {tint.rgb, 0}}) so the GPU-side rework (P5.1b-2 step 2)
  * can upload + BLAS them with the existing terrain machinery. Until entity textures land (P5.1b-2b) the
- * tint carries the model's vertex colour (white → grey-lit) and UVs are kept for later. The {@code
- * minX..maxZ} bounds + counts are for the step-1 verification probe (no GPU geometry yet).
+ * tint carries the model's vertex colour (white → grey-lit) and UVs are kept for later.
  */
 public final class RtEntityCapture implements VertexConsumer {
     final FloatArrayList verts = new FloatArrayList();   // 3 floats/vertex (capture-space position)
@@ -26,9 +25,6 @@ public final class RtEntityCapture implements VertexConsumer {
     final FloatArrayList uvList = new FloatArrayList();  // 2 floats/vertex (entity-texture UV, for P5.1b-2b)
     final FloatArrayList prim = new FloatArrayList();    // 8 floats/triangle: normal.xyz + 0, tint.rgb + 0
 
-    // Probe stats (step 1): captured bounds + a flag, reset per entity.
-    float minX, minY, minZ, maxX, maxY, maxZ;
-    boolean any;
     // P5.1b-2b: the bindless texture slot for the geometry currently being submitted (set by the
     // collector per submitModel, so body + feature layers get their own texture). Stored per-prim in
     // tint.w; the hit shader samples entityTex[texSlot].
@@ -47,18 +43,15 @@ public final class RtEntityCapture implements VertexConsumer {
     private final int[] qcol = new int[4];
     private final Vector3f scratch = new Vector3f(); // P5.1b-2d/e baked-quad position transform
 
-    /** Clear all accumulators + probe stats for a fresh entity capture. */
+    /** Clear all accumulators for a fresh entity capture. */
     public void reset() {
         verts.clear();
         idx.clear();
         uvList.clear();
         prim.clear();
         n = 0;
-        any = false;
         currentTexSlot = 0;
         uvRemap = false;
-        minX = minY = minZ = Float.MAX_VALUE;
-        maxX = maxY = maxZ = -Float.MAX_VALUE;
     }
 
     /** Remap subsequent {@link #addVertex} (ModelPart) UVs from 0..1 into a sprite's atlas region. */
@@ -77,14 +70,6 @@ public final class RtEntityCapture implements VertexConsumer {
 
     public boolean isEmpty() {
         return idx.isEmpty();
-    }
-
-    public int vertexCount() {
-        return verts.size() / 3;
-    }
-
-    public int triangleCount() {
-        return idx.size() / 3;
     }
 
     @Override
@@ -135,7 +120,6 @@ public final class RtEntityCapture implements VertexConsumer {
             verts.add(qz[i]);
             uvList.add(qu[i]);
             uvList.add(qv[i]);
-            track(qx[i], qy[i], qz[i]);
         }
         idx.add(base);
         idx.add(base + 1);
@@ -178,16 +162,6 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(tb);
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot (P5.1b-2b)
         }
-        any = true;
-    }
-
-    private void track(float x, float y, float z) {
-        minX = Math.min(minX, x);
-        minY = Math.min(minY, y);
-        minZ = Math.min(minZ, z);
-        maxX = Math.max(maxX, x);
-        maxY = Math.max(maxY, y);
-        maxZ = Math.max(maxZ, z);
     }
 
     // Unused VertexConsumer surface — ModelPart.Cube.compile only calls the bulk addVertex above.

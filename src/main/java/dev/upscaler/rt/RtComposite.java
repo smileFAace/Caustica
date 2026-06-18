@@ -358,8 +358,6 @@ public final class RtComposite {
             // The section BLAS are already built (async, by RtTerrain) and the entity cube BLAS is built
             // once; only the cheap instance-level TLAS is rebuilt per frame. Retired KEEP_FRAMES later,
             // once this frame is no longer in flight.
-            // P5.1b-2 step 1: throttled capture-pipeline probe (no-op unless -Dupscaler.rt.entityProbe).
-            RtEntities.INSTANCE.probe(camX, camY, camZ, frameProjection, frameViewRotation);
             // P5.1b-2: capture this frame's entities as real meshes; their per-entity BLAS are built
             // inline below and merged into the per-frame TLAS. geomTableAddr feeds the chit entity path
             // (per-prim normal/tint) and per-object motion vectors (0 when no model entities present).

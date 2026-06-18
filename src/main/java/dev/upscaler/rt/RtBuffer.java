@@ -12,16 +12,25 @@ public final class RtBuffer {
     public final long deviceAddress;
     /** Host pointer if created host-visible, else 0. */
     public final long mapped;
+    /** Allocated capacity in bytes (the requested size; used by {@link RtBufferPool} to satisfy reuse). */
+    public final long size;
+    /** The original usage flags passed to {@code createBuffer} (pre {@code SHADER_DEVICE_ADDRESS}); pool key. */
+    public final int usage;
+    /** Whether this buffer is host-visible+mapped; pool key. */
+    public final boolean hostVisible;
 
     private final long vma;
     private boolean destroyed;
 
-    RtBuffer(long vma, long handle, long allocation, long deviceAddress, long mapped) {
+    RtBuffer(long vma, long handle, long allocation, long deviceAddress, long mapped, long size, int usage, boolean hostVisible) {
         this.vma = vma;
         this.handle = handle;
         this.allocation = allocation;
         this.deviceAddress = deviceAddress;
         this.mapped = mapped;
+        this.size = size;
+        this.usage = usage;
+        this.hostVisible = hostVisible;
     }
 
     public void destroy() {
