@@ -119,6 +119,7 @@ public final class RtPipeline {
     public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages, int bindlessTextures, boolean blockMaterialAtlases) {
         VkDevice vk = ctx.vk();
         boolean hasAhit = rahit != null;
+        String label = "world RT pipeline";
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int firstExtraBinding = withAtlasSampler ? 3 : 2;
             // P6.2a/b: the LabPBR _s (binding 8) + _n (binding 9) atlases (combined image samplers) follow
@@ -153,6 +154,7 @@ public final class RtPipeline {
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout");
             long dsl = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
 
             int combinedSamplers = (withAtlasSampler ? 1 : 0) + materialSamplers; // block atlas + _s/_n atlases
             int poolSizeCount = 2 + (combinedSamplers > 0 ? 1 : 0);
@@ -166,6 +168,7 @@ public final class RtPipeline {
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(RING).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool");
             long pool = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, label + " descriptor pool");
             LongBuffer layouts = stack.mallocLong(RING);
             for (int i = 0; i < RING; i++) {
                 layouts.put(i, dsl);
@@ -176,6 +179,9 @@ public final class RtPipeline {
             check(VK10.vkAllocateDescriptorSets(vk, dsai, pSet), "vkAllocateDescriptorSets");
             long[] sets = new long[RING];
             pSet.get(sets);
+            for (int i = 0; i < RING; i++) {
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, sets[i], label + " descriptor set " + i);
+            }
 
             // P5.1b-2b: optional bindless set (set 1) — a partially-bound, update-after-bind
             // combined-image-sampler array the closest-hit samples per-prim for entity textures.
@@ -192,17 +198,20 @@ public final class RtPipeline {
                         .pNext(bf.address()).flags(VK12.VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT).pBindings(bl);
                 check(VK10.vkCreateDescriptorSetLayout(vk, bdslci, null, p), "vkCreateDescriptorSetLayout(bindless)");
                 bindlessLayout = p.get(0);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, bindlessLayout, label + " bindless descriptor set layout");
                 VkDescriptorPoolSize.Buffer bps = VkDescriptorPoolSize.calloc(1, stack);
                 bps.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(bindlessTextures);
                 VkDescriptorPoolCreateInfo bdpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
                         .flags(VK12.VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT).maxSets(1).pPoolSizes(bps);
                 check(VK10.vkCreateDescriptorPool(vk, bdpci, null, p), "vkCreateDescriptorPool(bindless)");
                 bindlessPool = p.get(0);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, bindlessPool, label + " bindless descriptor pool");
                 VkDescriptorSetAllocateInfo bdsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
                         .descriptorPool(bindlessPool).pSetLayouts(stack.longs(bindlessLayout));
                 LongBuffer bpSet = stack.mallocLong(1);
                 check(VK10.vkAllocateDescriptorSets(vk, bdsai, bpSet), "vkAllocateDescriptorSets(bindless)");
                 bindlessSet = bpSet.get(0);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, bindlessSet, label + " bindless descriptor set");
             }
 
             VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
@@ -219,6 +228,7 @@ public final class RtPipeline {
             }
             check(VK10.vkCreatePipelineLayout(vk, plci, null, p), "vkCreatePipelineLayout");
             long layout = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE_LAYOUT, layout, label + " pipeline layout");
 
             // Stages: raygen, one miss per rmiss entry, the closest-hit, then (optionally) the any-hit.
             // The closest-hit stage index is 1 + missCount; the any-hit, if any, follows it. Groups are
@@ -231,12 +241,18 @@ public final class RtPipeline {
             int ahitStage = chitStage + 1;
             int stageCount = groupCount + (hasAhit ? 1 : 0);
             long mGen = loadModule(vk, stack, rgen);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, mGen, label + " " + rgen);
             long[] mMiss = new long[missCount];
             for (int m = 0; m < missCount; m++) {
                 mMiss[m] = loadModule(vk, stack, rmiss[m]);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, mMiss[m], label + " " + rmiss[m]);
             }
             long mHit = loadModule(vk, stack, rchit);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, mHit, label + " " + rchit);
             long mAhit = hasAhit ? loadModule(vk, stack, rahit) : 0L;
+            if (hasAhit) {
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, mAhit, label + " " + rahit);
+            }
             ByteBuffer entry = stack.UTF8("main");
             VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(stageCount, stack);
             stages.get(0).sType$Default().stage(VK_SHADER_STAGE_RAYGEN_BIT_KHR).module(mGen).pName(entry);
@@ -267,6 +283,7 @@ public final class RtPipeline {
             check(vkCreateRayTracingPipelinesKHR(vk, VK10.VK_NULL_HANDLE, VK10.VK_NULL_HANDLE, rtpci, null, pPipeline),
                     "vkCreateRayTracingPipelinesKHR");
             long pipeline = pPipeline.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE, pipeline, label);
 
             VK10.vkDestroyShaderModule(vk, mGen, null);
             for (int m = 0; m < missCount; m++) {
@@ -282,7 +299,8 @@ public final class RtPipeline {
             ByteBuffer handles = stack.malloc(groupCount * handleSize);
             check(vkGetRayTracingShaderGroupHandlesKHR(vk, pipeline, 0, groupCount, handles), "vkGetRayTracingShaderGroupHandlesKHR");
             long stride = align(handleSize, ctx.shaderGroupBaseAlignment());
-            RtBuffer sbt = ctx.createBuffer(stride * groupCount, VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, true);
+            RtBuffer sbt = ctx.createBuffer(stride * groupCount, VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR, true,
+                    label + " shader binding table");
             for (int g = 0; g < groupCount; g++) {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
@@ -405,7 +423,7 @@ public final class RtPipeline {
 
     /** Record bind (+ optional raygen push constants) + trace into the given command buffer. */
     public void trace(VkCommandBuffer cmd, int width, int height, java.nio.ByteBuffer pushConstants) {
-        try (MemoryStack stack = MemoryStack.stackPush()) {
+        try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "trace rays")) {
             VK10.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
             java.nio.LongBuffer boundSets = bindlessSet != 0L
                     ? stack.longs(descriptorSets[currentSet], bindlessSet)

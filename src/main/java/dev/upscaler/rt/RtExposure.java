@@ -41,15 +41,16 @@ final class RtExposure {
 
     void ensureResources(RtContext ctx) {
         if (image == null) {
-            image = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R32_SFLOAT);
+            image = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R32_SFLOAT, "display exposure");
         }
         if (mode == Mode.AUTO) {
             if (histogram == null) {
                 histogram = ctx.createBuffer(256L * Integer.BYTES,
-                        VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT, false);
+                        VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT, false,
+                        "exposure histogram");
             }
             if (state == null) {
-                state = ctx.createBuffer(16, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true);
+                state = ctx.createBuffer(16, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "exposure state");
                 resetAutoHistory();
             }
             if (pipeline == null) {
@@ -59,20 +60,22 @@ final class RtExposure {
         logOnce();
     }
 
-    void record(VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
+    void record(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
         if (image == null) {
             throw new IllegalStateException("RT exposure image not created");
         }
         if (mode == Mode.AUTO) {
-            recordAuto(cmd, stack, traceColor);
+            recordAuto(ctx, cmd, stack, traceColor);
             return;
         }
-        VkClearColorValue color = VkClearColorValue.calloc(stack);
-        color.float32(0, exposureScale());
-        VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
-        range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
-                .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
-        VK10.vkCmdClearColorImage(cmd, image.image, VK10.VK_IMAGE_LAYOUT_GENERAL, color, range);
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure fixed write")) {
+            VkClearColorValue color = VkClearColorValue.calloc(stack);
+            color.float32(0, exposureScale());
+            VkImageSubresourceRange.Buffer range = VkImageSubresourceRange.calloc(1, stack);
+            range.get(0).aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
+            VK10.vkCmdClearColorImage(cmd, image.image, VK10.VK_IMAGE_LAYOUT_GENERAL, color, range);
+        }
     }
 
     void destroy() {
@@ -102,12 +105,14 @@ final class RtExposure {
         };
     }
 
-    private void recordAuto(VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
+    private void recordAuto(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
         if (pipeline == null || histogram == null || state == null) {
             throw new IllegalStateException("RT auto exposure resources not created");
         }
         pipeline.setResources(traceColor.view, histogram, image.view, state);
-        VK10.vkCmdFillBuffer(cmd, histogram.handle, 0, histogram.size, 0);
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure histogram clear")) {
+            VK10.vkCmdFillBuffer(cmd, histogram.handle, 0, histogram.size, 0);
+        }
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
         pipeline.dispatchHistogram(cmd, traceColor.width, traceColor.height);
         VulkanCommandEncoder.memoryBarrier(cmd, stack);

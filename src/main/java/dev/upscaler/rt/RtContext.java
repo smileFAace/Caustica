@@ -131,6 +131,11 @@ public final class RtContext {
 
     /** Create a VMA buffer; {@code SHADER_DEVICE_ADDRESS} is always added so it has a device address. */
     public RtBuffer createBuffer(long size, int usage, boolean hostVisible) {
+        return createBuffer(size, usage, hostVisible, "buffer " + size + "B");
+    }
+
+    /** Create a VMA buffer; {@code SHADER_DEVICE_ADDRESS} is always added so it has a device address. */
+    public RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkBufferCreateInfo bci = VkBufferCreateInfo.calloc(stack).sType$Default()
                     .size(size).usage(usage | VK12.VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT)
@@ -144,6 +149,7 @@ public final class RtContext {
             VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
             check(Vma.vmaCreateBuffer(vma, bci, aci, pBuf, pAlloc, info), "vmaCreateBuffer");
             long handle = pBuf.get(0);
+            RtDebugLabels.nameBuffer(this, handle, label);
             VkBufferDeviceAddressInfo bdai = VkBufferDeviceAddressInfo.calloc(stack).sType$Default().buffer(handle);
             long address = VK12.vkGetBufferDeviceAddress(vk, bdai);
             return new RtBuffer(vma, handle, pAlloc.get(0), address, hostVisible ? info.pMappedData() : 0L, size, usage, hostVisible);
@@ -162,6 +168,10 @@ public final class RtContext {
      * for the vkCmdCopyImage round-trip (copy requires texel-size-compatible formats).
      */
     public RtImage createStorageImage(int width, int height, int format) {
+        return createStorageImage(width, height, format, "storage image " + width + "x" + height);
+    }
+
+    public RtImage createStorageImage(int width, int height, int format, String label) {
         long image;
         long allocation;
         long view;
@@ -181,6 +191,7 @@ public final class RtContext {
             check(Vma.vmaCreateImage(vma, ici, iaci, pImage, pAlloc, null), "vmaCreateImage");
             image = pImage.get(0);
             allocation = pAlloc.get(0);
+            RtDebugLabels.nameImage(this, image, label);
 
             VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
                     .image(image).viewType(VK10.VK_IMAGE_VIEW_TYPE_2D).format(format);
@@ -188,10 +199,11 @@ public final class RtContext {
             LongBuffer pView = stack.mallocLong(1);
             check(VK10.vkCreateImageView(vk, vci, null, pView), "vkCreateImageView");
             view = pView.get(0);
+            RtDebugLabels.nameImageView(this, view, label + " view");
         }
         long imageFinal = image;
         submitSync(cmd -> {
-            try (MemoryStack stack = MemoryStack.stackPush()) {
+            try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
                 VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
                 b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
                         .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT
@@ -219,6 +231,7 @@ public final class RtContext {
             PointerBuffer pCmd = stack.mallocPointer(1);
             check(VK10.vkAllocateCommandBuffers(vk, ai, pCmd), "vkAllocateCommandBuffers");
             VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), vk);
+            RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "submitSync command buffer");
 
             VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
@@ -230,6 +243,7 @@ public final class RtContext {
             LongBuffer pFence = stack.mallocLong(1);
             check(VK10.vkCreateFence(vk, fci, null, pFence), "vkCreateFence");
             long fence = pFence.get(0);
+            RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_FENCE, fence, "submitSync fence");
 
             VkSubmitInfo si = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(cmd));
             check(VK10.vkQueueSubmit(graphicsQueue.vkQueue(), si, fence), "vkQueueSubmit");
@@ -257,6 +271,7 @@ public final class RtContext {
             PointerBuffer pCmd = stack.mallocPointer(1);
             check(VK10.vkAllocateCommandBuffers(vk, ai, pCmd), "vkAllocateCommandBuffers(async)");
             VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), vk);
+            RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "submitAsync command buffer");
 
             VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK10.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT);
@@ -268,6 +283,7 @@ public final class RtContext {
             LongBuffer pFence = stack.mallocLong(1);
             check(VK10.vkCreateFence(vk, fci, null, pFence), "vkCreateFence(async)");
             long fence = pFence.get(0);
+            RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_FENCE, fence, "submitAsync fence");
 
             VkSubmitInfo si = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(cmd));
             check(VK10.vkQueueSubmit(graphicsQueue.vkQueue(), si, fence), "vkQueueSubmit(async)");
@@ -314,6 +330,7 @@ public final class RtContext {
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateCommandPool(vk, ci, null, p), "vkCreateCommandPool");
             commandPool = p.get(0);
+            RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_COMMAND_POOL, commandPool, "transient command pool");
         }
     }
 

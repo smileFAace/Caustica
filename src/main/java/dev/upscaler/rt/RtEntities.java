@@ -353,10 +353,16 @@ public final class RtEntities {
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = capture.verts.size() / 3;
         int idxCount = capture.idx.size();
-        RtBuffer positions = pool.acquire(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true);
-        RtBuffer indices = pool.acquire(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true);
-        RtBuffer uvs = pool.acquire(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true);
-        RtBuffer prim = pool.acquire(ctx, (long) capture.prim.size() * Float.BYTES, storage, true);
+        BlockPos p = be.getBlockPos();
+        String label = "block entity " + p.getX() + "," + p.getY() + "," + p.getZ();
+        RtBuffer positions = pool.acquire(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
+                label + " positions");
+        RtBuffer indices = pool.acquire(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
+                label + " indices");
+        RtBuffer uvs = pool.acquire(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
+                label + " uvs");
+        RtBuffer prim = pool.acquire(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
+                label + " prim");
         MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
         MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
         MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
@@ -366,7 +372,8 @@ public final class RtEntities {
         // backing and exposes the build scratch separately (released at the frames-in-flight horizon). We
         // never refit it — a changed BE gets a fresh AS and the old one is defer-freed — so no in-place
         // write can race an in-flight trace.
-        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, pool, positions, vertCount, indices, idxCount, false);
+        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, pool, positions, vertCount, indices, idxCount, false,
+                label + " BLAS");
         build.blas.add(ub.op());
         build.refitScratch.add(ub.scratch());
         beBuildsThisFrame++;
@@ -378,7 +385,6 @@ public final class RtEntities {
         e.indices = indices;
         e.uvs = uvs;
         e.prim = prim;
-        BlockPos p = be.getBlockPos();
         e.bx = p.getX();
         e.by = p.getY();
         e.bz = p.getZ();
@@ -485,10 +491,15 @@ public final class RtEntities {
         int idxCount = capture.idx.size();
         // Pooled: acquire returns capacity ≥ requested (power-of-two bucket); we write only the exact
         // prefix and pass exact counts to the BLAS/geom-table, so the unused tail is harmless.
-        RtBuffer positions = pool.acquire(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true);
-        RtBuffer indices = pool.acquire(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true);
-        RtBuffer uvs = pool.acquire(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true);
-        RtBuffer prim = pool.acquire(ctx, (long) capture.prim.size() * Float.BYTES, storage, true);
+        String label = entityId >= 0 ? "entity " + entityId : "entity mesh " + build.count;
+        RtBuffer positions = pool.acquire(ctx, (long) capture.verts.size() * Float.BYTES, asInput, true,
+                label + " positions");
+        RtBuffer indices = pool.acquire(ctx, (long) capture.idx.size() * Integer.BYTES, asInput | storage, true,
+                label + " indices");
+        RtBuffer uvs = pool.acquire(ctx, (long) capture.uvList.size() * Float.BYTES, storage, true,
+                label + " uvs");
+        RtBuffer prim = pool.acquire(ctx, (long) capture.prim.size() * Float.BYTES, storage, true,
+                label + " prim");
         MemoryUtil.memFloatBuffer(positions.mapped, capture.verts.size()).put(capture.verts.elements(), 0, capture.verts.size());
         MemoryUtil.memIntBuffer(indices.mapped, capture.idx.size()).put(capture.idx.elements(), 0, capture.idx.size());
         MemoryUtil.memFloatBuffer(uvs.mapped, capture.uvList.size()).put(capture.uvList.elements(), 0, capture.uvList.size());
@@ -497,9 +508,10 @@ public final class RtEntities {
         // Non-opaque so world.rahit alpha-tests the texture (cutout). Opaque texels pass to the chit.
         RtAccel accel;
         if (REFIT && entityId >= 0) {
-            accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount);
+            accel = refitOrBuild(ctx, build, entityId, positions, indices, vertCount, idxCount, label);
         } else {
-            RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlasPooled(ctx, pool, positions, vertCount, indices, idxCount, false);
+            RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlasPooled(ctx, pool, positions, vertCount, indices, idxCount, false,
+                    label + " BLAS");
             build.blas.add(blas);
             build.pooledBlas.add(blas);
             accel = blas.accel;
@@ -528,7 +540,7 @@ public final class RtEntities {
      * AS of the same topology, else a full ALLOW_UPDATE BUILD (first use of the slot, a topology change, or
      * the periodic BVH-quality rebuild). The mesh buffers + scratch are per-frame transients; the AS persists.
      */
-    private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, int entityId, RtBuffer positions, RtBuffer indices, int vertCount, int idxCount) {
+    private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, int entityId, RtBuffer positions, RtBuffer indices, int vertCount, int idxCount, String label) {
         int triCount = idxCount / 3;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         EntityAccel ea = entityAccels.computeIfAbsent(entityId, k -> new EntityAccel());
@@ -540,8 +552,9 @@ public final class RtEntities {
                 && slot.vertCount == vertCount && slot.triCount == triCount
                 && slot.updatesSinceBuild < REFIT_REBUILD_INTERVAL;
         if (canUpdate) {
-            RtBuffer scratch = pool.acquire(ctx, slot.updateScratchSize, storage, false);
-            build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false));
+            RtBuffer scratch = pool.acquire(ctx, slot.updateScratchSize, storage, false, label + " refit scratch");
+            build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false,
+                    label + " BLAS refit"));
             build.refitScratch.add(scratch);
             slot.updatesSinceBuild++;
             return slot.accel;
@@ -554,7 +567,8 @@ public final class RtEntities {
         } else if (slot.accel != null) {
             deferDestroyAccel(slot.accel, slot.backing);
         }
-        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, pool, positions, vertCount, indices, idxCount, false);
+        RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableBlasBuild(ctx, pool, positions, vertCount, indices, idxCount, false,
+                label + " BLAS");
         slot.accel = ub.accel();
         slot.backing = ub.backing();
         slot.vertCount = vertCount;
@@ -613,7 +627,8 @@ public final class RtEntities {
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         tableRing = new RtBuffer[TABLE_RING];
         for (int i = 0; i < TABLE_RING; i++) {
-            tableRing[i] = ctx.createBuffer((long) MAX_ENTITIES * TABLE_ENTRY_BYTES, storage, true);
+            tableRing[i] = ctx.createBuffer((long) MAX_ENTITIES * TABLE_ENTRY_BYTES, storage, true,
+                    "entity geometry table ring " + i);
         }
     }
 

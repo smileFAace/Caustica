@@ -310,16 +310,16 @@ public final class RtComposite {
         // RT traces into an HDR (R16G16B16A16_SFLOAT) target so radiance > 1 survives to the tonemap
         // seam in blend.comp. baseCopy stays R8G8B8A8 to match the vanilla world target it is copied
         // to/from (vkCmdCopyImage requires texel-size-compatible formats).
-        output = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
-        baseCopy = ctx.createStorageImage(width, height);
+        output = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "trace color " + renderW + "x" + renderH);
+        baseCopy = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R8G8B8A8_UNORM, "vanilla base copy " + width + "x" + height);
         // Guide buffers match the trace (render) resolution; DLSS-RR consumes them at render res.
-        gNormal = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
-        gAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
-        gDepth = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT);
-        gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT);
-        gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
+        gNormal = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide normal roughness " + renderW + "x" + renderH);
+        gAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide diffuse albedo " + renderW + "x" + renderH);
+        gDepth = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R32_SFLOAT, "guide linear depth " + renderW + "x" + renderH);
+        gMotion = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16_SFLOAT, "guide motion " + renderW + "x" + renderH);
+        gSpecAlbedo = ctx.createStorageImage(renderW, renderH, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "guide specular albedo " + renderW + "x" + renderH);
         // Display-res RT image the blend reads. Always present (DLSS-RR target, or blit-upscale fallback).
-        rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT);
+        rrOutput = ctx.createStorageImage(width, height, VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "DLSS-RR output " + width + "x" + height);
         exposure.ensureResources(ctx);
 
         mvHasPrev = false; // recreated images -> first MV frame is zero
@@ -359,7 +359,8 @@ public final class RtComposite {
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
-        try (MemoryStack stack = MemoryStack.stackPush()) {
+        RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
+        try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope frameLabel = RtDebugLabels.scope(ctx, cmd, "composite frame")) {
             // RR drives the upscale: trace + jitter at render res, DLSS-RR denoises+upscales to display.
             // Jitter is suppressed for the no-RR reference and for the debug guide views (raw inspection).
             boolean rrPath = RtDlssRr.ENABLED && DEBUG_VIEW == 0;
@@ -422,18 +423,22 @@ public final class RtComposite {
             // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
             // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
             if (!fe.blas().isEmpty()) {
-                RtAccel.recordBlasBuilds(cmd, fe.blas());
+                RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
             }
             RtAccel.PreparedTlas frameTlas = RtAccel.prepareTlas(ctx, fe.instances());
             active.setTlas(frameTlas.accel.handle);
-            RtAccel.recordTlasBuild(cmd, frameTlas);
+            RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
             deferredTlas.add(new DeferredTlas(frameCounter + KEEP_FRAMES, frameTlas));
 
-            active.trace(cmd, renderW, renderH, push);
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace")) {
+                active.trace(cmd, renderW, renderH, push);
+            }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT color visible to exposure histogram/fixed write
-            exposure.record(cmd, stack, output);
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure")) {
+                exposure.record(ctx, cmd, stack, output);
+            }
             // P4.2b: DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
             // RR reads them and writes the display-res denoised result straight into rrOutput, which
             // the blend reads. No copy-back: render and display sizes now differ.
@@ -442,8 +447,10 @@ public final class RtComposite {
                 // DLSS expects the reported jitter to be the NEGATION of what was added to the
                 // primary ray (pixelCenter += jitter), matching the mcvr reference (apply +J, report
                 // -J). The shader push above uses +jitter; report -jitter here.
-                rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
-                        gSpecAlbedo, gNormal, rrOutput, renderW, renderH, displayW, displayH, -jitterX, -jitterY);
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "DLSS-RR evaluate")) {
+                    rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
+                            gSpecAlbedo, gNormal, rrOutput, renderW, renderH, displayW, displayH, -jitterX, -jitterY);
+                }
             }
 
             // When DLSS-RR did not produce the display-res image (disabled, debug view, or a runtime
@@ -451,19 +458,27 @@ public final class RtComposite {
             // always has a display-res RT image. With RR off render == display, so this is a 1:1 copy.
             if (!rrDone) {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack);
-                blitUpscale(cmd, stack, output, rrOutput);
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "fallback upscale")) {
+                    blitUpscale(cmd, stack, output, rrOutput);
+                }
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
-            VK10.vkCmdCopyImage(cmd, dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
-                    baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, displayW, displayH));
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy vanilla base")) {
+                VK10.vkCmdCopyImage(cmd, dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                        baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, displayW, displayH));
+            }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
-            blendPipeline.dispatch(cmd, displayW, displayH, BLEND);
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "blend display")) {
+                blendPipeline.dispatch(cmd, displayW, displayH, BLEND);
+            }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
-            VK10.vkCmdCopyImage(cmd, baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
-                    dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, displayW, displayH));
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target")) {
+                VK10.vkCmdCopyImage(cmd, baseCopy.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
+                        dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, displayW, displayH));
+            }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
         }
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
@@ -606,6 +621,7 @@ public final class RtComposite {
                     throw new IllegalStateException("vkCreateSampler(block atlas) failed");
                 }
                 atlasSampler = p.get(0);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SAMPLER, atlasSampler, "block atlas sampler");
             }
         }
         return atlasSampler;

@@ -94,6 +94,7 @@ public final class RtAccel {
         private final int maxVertex;
         private final int triangleCount;
         private final boolean opaque;
+        private final String label;
         // P5-perf #1 (step 2): refit support. {@code updatable} = built with ALLOW_UPDATE (so it can be
         // refit later); {@code update} = this recorded op is an in-place UPDATE (refit) rather than a full
         // BUILD. Set for the entity refit path; false for terrain + pooled block entities.
@@ -101,7 +102,7 @@ public final class RtAccel {
         private final boolean update;
 
         private PreparedBlas(RtAccel accel, RtBuffer scratch, RtBuffer pooledBacking, long vertexAddr, long indexAddr,
-                             int maxVertex, int triangleCount, boolean opaque, boolean updatable, boolean update) {
+                             int maxVertex, int triangleCount, boolean opaque, String label, boolean updatable, boolean update) {
             this.accel = accel;
             this.scratch = scratch;
             this.pooledBacking = pooledBacking;
@@ -110,6 +111,7 @@ public final class RtAccel {
             this.maxVertex = maxVertex;
             this.triangleCount = triangleCount;
             this.opaque = opaque;
+            this.label = label;
             this.updatable = updatable;
             this.update = update;
         }
@@ -127,13 +129,23 @@ public final class RtAccel {
     /** Allocate a BLAS (AS + backing + scratch) and query sizes, but defer the build to {@link #recordBlasBuilds}. */
     public static PreparedBlas prepareTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                     RtBuffer indices, int indexCount, boolean opaque) {
+        return prepareTrianglesBlas(ctx, positions, vertexCount, indices, indexCount, opaque, "terrain BLAS");
+    }
+
+    /** Allocate a labelled BLAS (AS + backing + scratch) and query sizes, deferring the build. */
+    public static PreparedBlas prepareTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
+                                                    RtBuffer indices, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
+        String debugLabel = labelOr(label, "BLAS");
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, false);
-            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
-            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
-            RtAccel accel = createBlasOn(vk, stack, backing, sizes.accelerationStructureSize(), true);
-            return new PreparedBlas(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque, false, false);
+            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
+                    debugLabel + " backing");
+            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                    debugLabel + " build scratch");
+            RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), true, debugLabel);
+            return new PreparedBlas(accel, scratch, null, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
+                    indexCount / 3, opaque, debugLabel, false, false);
         }
     }
 
@@ -145,14 +157,24 @@ public final class RtAccel {
      */
     public static PreparedBlas prepareTrianglesBlasPooled(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
                                                           RtBuffer indices, int indexCount, boolean opaque) {
+        return prepareTrianglesBlasPooled(ctx, pool, positions, vertexCount, indices, indexCount, opaque, "pooled BLAS");
+    }
+
+    /** Pooled labelled variant of {@link #prepareTrianglesBlas}. */
+    public static PreparedBlas prepareTrianglesBlasPooled(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
+                                                          RtBuffer indices, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
+        String debugLabel = labelOr(label, "pooled BLAS");
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, false);
             // acquire() returns capacity ≥ requested size; the AS is created with the exact queried size.
-            RtBuffer backing = pool.acquire(ctx, sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
-            RtBuffer scratch = pool.acquire(ctx, sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
-            RtAccel accel = createBlasOn(vk, stack, backing, sizes.accelerationStructureSize(), false);
-            return new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress, vertexCount - 1, indexCount / 3, opaque, false, false);
+            RtBuffer backing = pool.acquire(ctx, sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
+                    debugLabel + " backing");
+            RtBuffer scratch = pool.acquire(ctx, sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                    debugLabel + " build scratch");
+            RtAccel accel = createBlasOn(ctx, stack, backing, sizes.accelerationStructureSize(), false, debugLabel);
+            return new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress, vertexCount - 1,
+                    indexCount / 3, opaque, debugLabel, false, false);
         }
     }
 
@@ -165,16 +187,25 @@ public final class RtAccel {
      */
     public static UpdatableBuild prepareUpdatableBlasBuild(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
                                                            RtBuffer indices, int indexCount, boolean opaque) {
+        return prepareUpdatableBlasBuild(ctx, pool, positions, vertexCount, indices, indexCount, opaque, "updatable BLAS");
+    }
+
+    /** Labelled variant of {@link #prepareUpdatableBlasBuild}. */
+    public static UpdatableBuild prepareUpdatableBlasBuild(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
+                                                           RtBuffer indices, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
+        String debugLabel = labelOr(label, "updatable BLAS");
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureBuildSizesInfoKHR sizes = queryBlasSizes(vk, stack, positions, indices, vertexCount, indexCount, opaque, true);
             long accelSize = sizes.accelerationStructureSize();
             long updateScratch = sizes.updateScratchSize();
-            RtBuffer backing = pool.acquire(ctx, accelSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
-            RtBuffer scratch = pool.acquire(ctx, sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
-            RtAccel accel = createBlasOn(vk, stack, backing, accelSize, false);
+            RtBuffer backing = pool.acquire(ctx, accelSize, VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
+                    debugLabel + " backing");
+            RtBuffer scratch = pool.acquire(ctx, sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                    debugLabel + " build scratch");
+            RtAccel accel = createBlasOn(ctx, stack, backing, accelSize, false, debugLabel);
             PreparedBlas op = new PreparedBlas(accel, scratch, backing, positions.deviceAddress, indices.deviceAddress,
-                    vertexCount - 1, indexCount / 3, opaque, true, false);
+                    vertexCount - 1, indexCount / 3, opaque, debugLabel, true, false);
             return new UpdatableBuild(op, accel, backing, scratch, updateScratch);
         }
     }
@@ -187,7 +218,15 @@ public final class RtAccel {
      */
     public static PreparedBlas refitUpdate(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr,
                                            int vertexCount, int indexCount, boolean opaque) {
-        return new PreparedBlas(accel, scratch, null, vertexAddr, indexAddr, vertexCount - 1, indexCount / 3, opaque, true, true);
+        return refitUpdate(accel, scratch, vertexAddr, indexAddr, vertexCount, indexCount, opaque, "BLAS refit");
+    }
+
+    /** Prepare a labelled in-place BLAS refit. */
+    public static PreparedBlas refitUpdate(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr,
+                                           int vertexCount, int indexCount, boolean opaque, String label) {
+        String debugLabel = labelOr(label, "BLAS refit");
+        return new PreparedBlas(accel, scratch, null, vertexAddr, indexAddr, vertexCount - 1, indexCount / 3,
+                opaque, debugLabel, true, true);
     }
 
     /** Reclaim a pooled BLAS: destroy its AS handle and return its backing + scratch buffers to the pool. */
@@ -227,12 +266,15 @@ public final class RtAccel {
                 | (allowUpdate ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0);
     }
 
-    private static RtAccel createBlasOn(VkDevice vk, MemoryStack stack, RtBuffer backing, long accelSize, boolean ownsBacking) {
+    private static RtAccel createBlasOn(RtContext ctx, MemoryStack stack, RtBuffer backing, long accelSize,
+                                        boolean ownsBacking, String label) {
+        VkDevice vk = ctx.vk();
         VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
                 .buffer(backing.handle).offset(0).size(accelSize).type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
         java.nio.LongBuffer pAs = stack.mallocLong(1);
         RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
         long handle = pAs.get(0);
+        RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
         VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
                 .sType$Default().accelerationStructure(handle);
         long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
@@ -266,12 +308,14 @@ public final class RtAccel {
         private final RtBuffer instanceBuffer;
         private final RtBuffer scratch;
         private final int instanceCount;
+        private final String label;
 
-        private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount) {
+        private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount, String label) {
             this.accel = accel;
             this.instanceBuffer = instanceBuffer;
             this.scratch = scratch;
             this.instanceCount = instanceCount;
+            this.label = label;
         }
 
         /**
@@ -290,8 +334,10 @@ public final class RtAccel {
     public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> instances) {
         VkDevice vk = ctx.vk();
         int count = instances.size();
+        String label = "frame TLAS " + count + " instances";
         RtBuffer instanceBuffer = ctx.createBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * count,
-                org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true);
+                org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true,
+                label + " instance buffer");
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Reuse a single record + transform buffer across all instances: allocating per-instance
             // on the MemoryStack (64 KB/thread) overflows it once there are hundreds of sections.
@@ -314,17 +360,20 @@ public final class RtAccel {
             vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                     build.get(0), stack.ints(count), sizes);
 
-            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false);
+            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
+                    label + " backing");
             VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
                     .buffer(backing.handle).offset(0).size(sizes.accelerationStructureSize()).type(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR);
             java.nio.LongBuffer pAs = stack.mallocLong(1);
             RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
             long handle = pAs.get(0);
-            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false);
+            RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
+            RtBuffer scratch = ctx.createBuffer(sizes.buildScratchSize(), VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, false,
+                    label + " build scratch");
             VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
                     .sType$Default().accelerationStructure(handle);
             long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
-            return new PreparedTlas(new RtAccel(vk, handle, deviceAddress, backing), instanceBuffer, scratch, count);
+            return new PreparedTlas(new RtAccel(vk, handle, deviceAddress, backing), instanceBuffer, scratch, count, label);
         }
     }
 
@@ -346,6 +395,15 @@ public final class RtAccel {
             try (MemoryStack stack = MemoryStack.stackPush()) { // per-iteration: avoid 64 KB stack overflow
                 recordBlasBuild(cmd, stack, b);
             }
+        }
+    }
+
+    /** Record labelled BLAS builds into the command buffer. */
+    public static void recordBlasBuilds(RtContext ctx, VkCommandBuffer cmd, List<PreparedBlas> blas) {
+        String label = blas.size() == 1 ? blas.get(0).label + (blas.get(0).update ? " refit" : " build")
+                : "BLAS builds " + blas.size();
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, label)) {
+            recordBlasBuilds(cmd, blas);
         }
     }
 
@@ -374,6 +432,13 @@ public final class RtAccel {
         }
     }
 
+    /** Record a labelled TLAS build into the command buffer. */
+    public static void recordTlasBuild(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, tlas.label + " build")) {
+            recordTlasBuild(cmd, tlas);
+        }
+    }
+
     private static void recordBlasBuild(VkCommandBuffer cmd, MemoryStack stack, PreparedBlas b) {
         VkAccelerationStructureGeometryKHR.Buffer geom = triangleGeometry(stack, b.vertexAddr, b.indexAddr, b.maxVertex + 1, b.opaque);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
@@ -392,5 +457,9 @@ public final class RtAccel {
         range.get(0).primitiveCount(b.triangleCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
         PointerBuffer ppRange = stack.mallocPointer(1).put(0, range.address());
         vkCmdBuildAccelerationStructuresKHR(cmd, build, ppRange);
+    }
+
+    private static String labelOr(String label, String fallback) {
+        return label == null || label.isBlank() ? fallback : label;
     }
 }

@@ -44,6 +44,11 @@ public final class RtBufferPool {
 
     /** Acquire a buffer with capacity ≥ {@code minSize} for the given usage, reusing a free one if available. */
     public RtBuffer acquire(RtContext ctx, long minSize, int usage, boolean hostVisible) {
+        return acquire(ctx, minSize, usage, hostVisible, "pooled buffer " + minSize + "B");
+    }
+
+    /** Acquire a buffer with capacity ≥ {@code minSize} for the given usage, reusing a free one if available. */
+    public RtBuffer acquire(RtContext ctx, long minSize, int usage, boolean hostVisible, String label) {
         long bucket = ceilPow2(Math.max(minSize, MIN_BUCKET));
         ArrayDeque<RtBuffer> list = free.get(new PoolKey(usage, hostVisible, bucket));
         if (list != null && !list.isEmpty()) {
@@ -51,7 +56,7 @@ public final class RtBufferPool {
             return list.pop();
         }
         created++;
-        return ctx.createBuffer(bucket, usage, hostVisible);
+        return ctx.createBuffer(bucket, usage, hostVisible, label + " bucket " + bucket + "B");
     }
 
     /** Return a buffer to the pool for reuse (or destroy it if the matching free-list is already full). */

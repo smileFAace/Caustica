@@ -89,7 +89,7 @@ abstract class CompileShaders extends DefaultTask {
 		srcDir.get().asFile.listFiles().findAll { it.isFile() && it.name ==~ stages }.each { src ->
 			def spv = new File(outDirFile, "${src.name}.spv")
 			execOps.exec {
-				commandLine glslang.get(), "-V", "--target-env", "vulkan1.2", src.absolutePath, "-o", spv.absolutePath
+				commandLine glslang.get(), "-V", "--target-env", "vulkan1.2", "-gVS", src.absolutePath, "-o", spv.absolutePath
 			}
 			execOps.exec {
 				commandLine spirvVal.get(), "--target-env", "vulkan1.2", spv.absolutePath

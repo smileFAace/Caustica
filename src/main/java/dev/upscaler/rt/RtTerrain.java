@@ -359,10 +359,15 @@ public final class RtTerrain {
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         int vertCount = mesh.verts.size() / 3;
         int idxCount = mesh.idx.size();
-        RtBuffer positions = ctx.createBuffer((long) mesh.verts.size() * Float.BYTES, asInput, true);
-        RtBuffer indices = ctx.createBuffer((long) mesh.idx.size() * Integer.BYTES, asInput | storage, true);
-        RtBuffer uvs = ctx.createBuffer((long) mesh.uvList.size() * Float.BYTES, storage, true);
-        RtBuffer material = ctx.createBuffer((long) mesh.prim.size() * Float.BYTES, storage, true);
+        String label = "terrain section " + sox + "," + soy + "," + soz;
+        RtBuffer positions = ctx.createBuffer((long) mesh.verts.size() * Float.BYTES, asInput, true,
+                label + " positions");
+        RtBuffer indices = ctx.createBuffer((long) mesh.idx.size() * Integer.BYTES, asInput | storage, true,
+                label + " indices");
+        RtBuffer uvs = ctx.createBuffer((long) mesh.uvList.size() * Float.BYTES, storage, true,
+                label + " uvs");
+        RtBuffer material = ctx.createBuffer((long) mesh.prim.size() * Float.BYTES, storage, true,
+                label + " material");
         MemoryUtil.memFloatBuffer(positions.mapped, mesh.verts.size()).put(mesh.verts.elements(), 0, mesh.verts.size());
         MemoryUtil.memIntBuffer(indices.mapped, mesh.idx.size()).put(mesh.idx.elements(), 0, mesh.idx.size());
         MemoryUtil.memFloatBuffer(uvs.mapped, mesh.uvList.size()).put(mesh.uvList.elements(), 0, mesh.uvList.size());
@@ -370,7 +375,8 @@ public final class RtTerrain {
 
         // Cutout geometry: non-opaque so the any-hit shader alpha-tests the atlas (foliage/glass).
         // The BLAS build is deferred — the caller batches all sections' builds into one submission.
-        RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false);
+        RtAccel.PreparedBlas blas = RtAccel.prepareTrianglesBlas(ctx, positions, vertCount, indices, idxCount, false,
+                label + " BLAS");
         return new PreparedSection(key, positions, indices, uvs, material, blas, sox, soy, soz);
     }
 
@@ -412,7 +418,8 @@ public final class RtTerrain {
         }
 
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        RtBuffer newTable = ctx.createBuffer((long) ordered.size() * SECTION_ENTRY_BYTES, storage, true);
+        RtBuffer newTable = ctx.createBuffer((long) ordered.size() * SECTION_ENTRY_BYTES, storage, true,
+                "terrain section table " + ordered.size() + " sections");
         List<RtAccel.Instance> instances = new ArrayList<>(ordered.size());
         for (int i = 0; i < ordered.size(); i++) {
             SectionGeom g = ordered.get(i);
@@ -432,7 +439,7 @@ public final class RtTerrain {
             blasBuilds.add(ps.blas());
         }
         // BLAS-only async build (empty when this tick only freed sections — completes immediately).
-        RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBlasBuilds(cmd, blasBuilds));
+        RtContext.AsyncSubmit op = ctx.submitAsync(cmd -> RtAccel.recordBlasBuilds(ctx, cmd, blasBuilds));
         pending = new Pending(op, blasBuilds, newTable, instances, removed, rbx, rby, rbz);
     }
 
