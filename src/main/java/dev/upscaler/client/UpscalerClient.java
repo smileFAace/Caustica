@@ -10,6 +10,7 @@ import dev.upscaler.rt.RtWorkerPool;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.rendering.v1.InvalidateRenderStateCallback;
 
 public final class UpscalerClient implements ClientModInitializer {
 	private static boolean rtInitDone = false;
@@ -45,6 +46,12 @@ public final class UpscalerClient implements ClientModInitializer {
 				}
 			}
 		});
+
+		// Vanilla's full render-state invalidation (LevelExtractor.allChanged(): dimension change via
+		// setLevel, render-distance change, F3+A) — drop RT terrain residency so it rebuilds for the new
+		// world. Fixes stale geometry persisting across an End→Overworld switch (coords alone aren't
+		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
+		InvalidateRenderStateCallback.EVENT.register(RtTerrain::requestFullClear);
 
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
 			shutdownRt();

@@ -106,6 +106,13 @@ public final class RtTerrain {
     // only builds the static section BLAS asynchronously and publishes the instance list + table.
     private List<RtAccel.Instance> staticInstances;
     private boolean ready;
+    // Full-residency invalidation requested off the render thread. Wired to Fabric's
+    // InvalidateRenderStateCallback = vanilla LevelExtractor.allChanged() (dimension change via setLevel,
+    // render-distance change, F3+A). Consumed in tick(), where the RT context is available.
+    private volatile boolean fullClearRequested;
+    // Re-extract every live section to recompute LabPBR material flags against (re)loaded atlases — used
+    // after a resource reload, which does NOT route through allChanged(). Consumed in tick().
+    private volatile boolean reresolveAllRequested;
     // Rebase origin (player block at the last TLAS rebuild) for the instance transforms + ray camOffset.
     public int blockX;
     public int blockY;
@@ -179,6 +186,26 @@ public final class RtTerrain {
         }
     }
 
+    /**
+     * Request a full residency clear, applied on the next {@link #tick} (render thread, where the RT
+     * context is available). Wired to Fabric's {@code InvalidateRenderStateCallback} — vanilla's
+     * {@link net.minecraft.client.renderer.extract.LevelExtractor#allChanged()}, which fires on a
+     * dimension change (via {@code setLevel}), a render-distance change, and F3+A. Thread-safe.
+     */
+    public static void requestFullClear() {
+        INSTANCE.fullClearRequested = true;
+    }
+
+    /**
+     * Mark every resident (and known-empty) section for re-extraction so its per-prim LabPBR material
+     * flags ({@code hasS}/{@code hasN}) are recomputed against freshly (re)loaded atlases. Used after a
+     * resource reload, which does <em>not</em> route through {@code allChanged()}. Geometry stays live
+     * until each section's rebuild swaps in. Applied on the next {@link #tick} (render thread).
+     */
+    public static void markAllDirty() {
+        INSTANCE.reresolveAllRequested = true;
+    }
+
     private void tick(RtContext ctx) {
         processDeferredFrees();
 
@@ -187,6 +214,23 @@ public final class RtTerrain {
         if (level == null || mc.player == null) {
             clear(ctx); // left the world — drop all geometry (drains + frees, incl. any in-flight build)
             return;
+        }
+
+        // Full clear on an explicit invalidation — vanilla's LevelExtractor.allChanged() via the Fabric
+        // InvalidateRenderStateCallback. That fires on a dimension switch (setLevel → allChanged),
+        // render-distance change, and F3+A. Without it, End→Overworld keeps the old dimension's geometry:
+        // residency is keyed by raw section coords (no world identity), so the same coords stay resident
+        // and are never rebuilt for the new world.
+        if (fullClearRequested) {
+            fullClearRequested = false;
+            clear(ctx);
+        }
+
+        // Re-extract all live sections after a resource reload so material flags pick up the new atlases.
+        if (reresolveAllRequested) {
+            reresolveAllRequested = false;
+            dirty.addAll(resident.keySet());
+            dirty.addAll(empty);
         }
 
         // One GPU build in flight at a time. When it finishes, finalize and FALL THROUGH so this same
@@ -720,6 +764,7 @@ public final class RtTerrain {
     /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx) {
         cancelJobs();
+        dirty.clear(); // any pending re-extract keys refer to the old world/coords — drop them
         if (pending == null && resident.isEmpty() && sectionTable == null && deferred.isEmpty()) {
             empty.clear();
             staticInstances = null;
