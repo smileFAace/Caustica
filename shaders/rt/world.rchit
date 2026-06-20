@@ -49,12 +49,25 @@ layout(binding = 9, set = 0) uniform sampler2D blockNormalAtlas;
 // hit path. Slot 0 is a fallback. Entities use per-type texture files, so each RenderType gets a slot.
 layout(binding = 0, set = 1) uniform sampler2D entityTex[];
 
-layout(push_constant) uniform Push {
+// P6.4: per-frame push data lives in a host-visible BDA buffer (the old inline block hit the 256-byte
+// push-constant ceiling); only its 8-byte address is pushed. The hit shaders read just two table
+// addresses, so `pc` is a macro that lazily loads the needed field — no whole-struct copy per hit. The
+// std430 layout matches the CPU writer (RtComposite) and the raygen WorldPush exactly.
+struct WorldPush {
     mat4 invViewProj;
     vec3 camOffset;
-    uint64_t tableAddr;
-    layout(offset = 184) uint64_t entityTableAddr;
-} pc;
+    uint64_t tableAddr;        // 80  section table
+    uint debugView; uint frameIndex;
+    mat4 prevViewProj;
+    vec3 camDelta; uint spp;
+    vec2 jitter;
+    uint64_t entityTableAddr;  // 184 entity geometry table
+    uint flags;
+    vec4 sunDir; vec4 lightDir; vec4 lightRadiance;
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WorldPushRef { WorldPush v; };
+layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
+#define pc WorldPushRef(pcAddr.worldPushAddr).v
 
 struct Payload {
     vec3 albedo;

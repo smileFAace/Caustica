@@ -1,5 +1,9 @@
 #version 460
 #extension GL_EXT_ray_tracing : require
+// P6.4: the per-frame push data is read from a BDA buffer (WorldPushRef) addressed by an 8-byte push
+// constant, so raygen now needs buffer-reference + 64-bit integer support (the hit shaders already had them).
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 // P3.1a: brute-force path tracer ("vanilla-pt"). Perspective primary rays from Minecraft's camera.
 // invViewProj = inverse(proj * viewRot) maps clip -> camera-relative world. We reconstruct the ray
@@ -34,34 +38,29 @@ layout(binding = 5, set = 0, r32f)    uniform image2D gDepth;  // r linear hit d
 layout(binding = 6, set = 0, rg16f)   uniform image2D gMotion;    // xy screen-space motion (render pixels)
 layout(binding = 7, set = 0, rgba16f) uniform image2D gSpecAlbedo; // specular albedo (0 — diffuse-only)
 
-layout(push_constant) uniform Push {
-    mat4 invViewProj;
-    vec3 camOffset;
-    // Debug guide-buffer view: 0=render, 1=normals, 2=albedo, 3=depth, 4=roughness, 5=motion.
-    // Explicit offset 88 clears the closest-hit/any-hit section-table address at 80 (raygen ignores it).
-    layout(offset = 88) uint debugView;
-    // Monotonic frame index — varies the per-pixel RNG each frame so the denoiser's temporal reuse has
-    // fresh samples to average (essential at low spp; otherwise identical noise repeats every frame).
-    layout(offset = 92) uint frameIndex;
-    // Motion vectors (P4.0b): previous frame's camera-relative view-projection, and the camera's
-    // per-frame translation (curCam - prevCam). The current screen position of a primary hit is the
-    // pixel centre, so only the previous-frame projection of the same world point is needed.
-    layout(offset = 96)  mat4 prevViewProj;
-    layout(offset = 160) vec3 camDelta;
-    layout(offset = 172) uint spp; // samples per pixel this frame (>=1); low for the RR-denoised path
-    // P4.2b sub-pixel camera jitter, in render pixels (the same Halton offset reported to DLSS-RR).
-    // Applied to the primary ray only; the motion-vector pass keeps the unjittered pixel centre.
-    layout(offset = 176) vec2 jitter;
-    // (offset 184 is the closest-hit/any-hit entityTableAddr (u64); raygen ignores it.)
-    // P6.1 flags: bit 0 = camera is submerged in water (init the dielectric medium), bit 1 = PBR BRDF
-    // enabled (else the legacy Lambertian path + diffuse-only guides for a clean A/B).
-    layout(offset = 192) uint flags;
-    // P6.3 dynamic sky (pushed each frame from RtComposite, derived from the game's time of day):
-    layout(offset = 208) vec4 sunDir;        // xyz = true sun direction (sky glow/disc), w = dayFactor 0..1
-    layout(offset = 224) vec4 lightDir;      // xyz = active NEE light dir (sun above horizon, else moon),
-                                             // w = light angular radius in radians (P6.3b; 0 = hard shadow)
-    layout(offset = 240) vec4 lightRadiance; // xyz = HDR radiance of that light (warm/dim low, white high)
-} pc;
+// P6.4: the per-frame push data moved out of inline push constants (the 256-byte block hit the 256-byte
+// NVIDIA push-constant ceiling) into a host-visible BDA buffer; only its 8-byte address is pushed. The
+// std430 layout of this struct lands on the exact byte offsets the old push block used (see RtComposite),
+// so the CPU writer is unchanged. raygen loads it once into the `pc` global at the top of main().
+struct WorldPush {
+    mat4 invViewProj;          // 0
+    vec3 camOffset;            // 64
+    uint64_t tableAddr;        // 80  closest-hit/any-hit section table (raygen ignores it)
+    uint debugView;            // 88  0=render,1=normals,2=albedo,3=depth,4=roughness,5=motion,6=specular
+    uint frameIndex;           // 92  per-frame RNG variation for the denoiser's temporal reuse
+    mat4 prevViewProj;         // 96  P4.0b motion vectors: previous-frame camera-relative view-projection
+    vec3 camDelta;             // 160 curCam - prevCam
+    uint spp;                  // 172 samples per pixel this frame (>=1); low for the RR-denoised path
+    vec2 jitter;               // 176 P4.2b sub-pixel jitter, render px (+ on the ray, - reported to RR)
+    uint64_t entityTableAddr;  // 184 P5.1b-2 entity geometry table (closest-hit/any-hit)
+    uint flags;                // 192 bit0 = camera submerged, bit1 = PBR BRDF enabled
+    vec4 sunDir;               // 208 P6.3 xyz true sun direction (sky glow/disc), w dayFactor 0..1
+    vec4 lightDir;             // 224 xyz active NEE light dir (sun above horizon else moon), w radius (rad)
+    vec4 lightRadiance;        // 240 xyz HDR radiance of the active light (warm/dim low, white high)
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer WorldPushRef { WorldPush v; };
+layout(push_constant) uniform PushAddr { uint64_t worldPushAddr; } pcAddr;
+WorldPush pc; // populated from the BDA buffer at the top of main()
 
 // First-hit (primary-visibility) guide attributes, captured at bounce 0 of tracePath. The primary ray
 // is deterministic (no AA jitter yet), so every SPP sample's bounce 0 yields identical values.
@@ -446,6 +445,7 @@ vec3 tracePath(vec3 ro, vec3 rd, inout uint seed) {
 }
 
 void main() {
+    pc = WorldPushRef(pcAddr.worldPushAddr).v; // P6.4: load the per-frame push data from the BDA buffer
     const ivec2 pix = ivec2(gl_LaunchIDEXT.xy);
     const vec2 size = vec2(gl_LaunchSizeEXT.xy);
     vec2 uv = (vec2(pix) + 0.5) / size;

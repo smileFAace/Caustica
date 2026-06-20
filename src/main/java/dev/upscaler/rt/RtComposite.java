@@ -20,6 +20,7 @@ import org.joml.Vector3f;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkImageBlit;
@@ -113,6 +114,13 @@ public final class RtComposite {
     }
 
     private RtPipeline worldPipeline;
+    // P6.4: the world push data (256 B) is uploaded to a host-visible BDA ring instead of inline push
+    // constants, which were maxed at the 256-byte NVIDIA ceiling. Only the 8-byte slot address is pushed
+    // now (see WorldPushRef in the world shaders). One slot per in-flight frame, cycled per frame so an
+    // in-flight slot is never overwritten; created with the world pipeline and freed at shutdown.
+    private static final int PUSH_RING = 6;
+    private RtBuffer[] pushRing;
+    private int pushSlot;
     private RtBlendPipeline blendPipeline;
     private RtImage output;
     private RtImage baseCopy;
@@ -216,7 +224,15 @@ public final class RtComposite {
         if (worldPipeline == null) {
             worldPipeline = RtPipeline.create(ctx, "world.rgen.spv",
                     new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
-                    WORLD_PUSH_SIZE, true, GUIDE_COUNT, RtEntityTextures.MAX_TEXTURES, RtMaterials.ENABLED);
+                    Long.BYTES, true, GUIDE_COUNT, RtEntityTextures.MAX_TEXTURES, RtMaterials.ENABLED);
+            // P6.4: per-frame push data now lives in this BDA ring; the pipeline only pushes its address.
+            if (pushRing == null) {
+                pushRing = new RtBuffer[PUSH_RING];
+                for (int i = 0; i < PUSH_RING; i++) {
+                    pushRing[i] = ctx.createBuffer(WORLD_PUSH_SIZE,
+                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i);
+                }
+            }
             if (output != null) {
                 worldPipeline.setStorageImage(output.view);
                 bindGuideImages();
@@ -374,7 +390,12 @@ public final class RtComposite {
 
             boolean rrDone = false;
             RtTerrain terrain = RtTerrain.currentOrNull();
-            ByteBuffer push = stack.malloc(WORLD_PUSH_SIZE);
+            // P6.4: write this frame's push data into the next BDA ring slot (cycled so an in-flight slot
+            // is never overwritten). The std430 WorldPush layout matches these byte offsets exactly, so
+            // the put(offset, ...) writes below — and writeSky(push) — are unchanged from the inline-push era.
+            pushSlot = (pushSlot + 1) % PUSH_RING;
+            RtBuffer pushBuf = pushRing[pushSlot];
+            ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
             new Matrix4f(frameProjection).mul(frameViewRotation).invert().get(0, push);
             push.putFloat(64, (float) (camX - terrain.blockX));
             push.putFloat(68, (float) (camY - terrain.blockY));
@@ -432,8 +453,10 @@ public final class RtComposite {
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
             deferredTlas.add(new DeferredTlas(frameCounter + KEEP_FRAMES, frameTlas));
 
+            // P6.4: push only the 8-byte device address of this frame's filled push-data slot.
+            ByteBuffer pushAddr = stack.malloc(Long.BYTES).putLong(0, pushBuf.deviceAddress);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace")) {
-                active.trace(cmd, renderW, renderH, push);
+                active.trace(cmd, renderW, renderH, pushAddr);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT color visible to exposure histogram/fixed write
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure")) {
@@ -596,6 +619,14 @@ public final class RtComposite {
         if (worldPipeline != null) {
             worldPipeline.destroy();
             worldPipeline = null;
+        }
+        if (pushRing != null) {
+            for (RtBuffer b : pushRing) {
+                if (b != null) {
+                    b.destroy();
+                }
+            }
+            pushRing = null;
         }
         if (atlasSampler != 0L) {
             RtContext ctx = RtContext.currentOrNull();
