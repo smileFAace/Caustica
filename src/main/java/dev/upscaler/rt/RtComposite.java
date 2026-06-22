@@ -12,10 +12,14 @@ import dev.upscaler.client.UpscalerJitter;
 import dev.upscaler.mixin.CommandEncoderAccessor;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.core.BlockPos;
+import net.minecraft.data.AtlasIds;
+import net.minecraft.resources.Identifier;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.attribute.EnvironmentAttributes;
+import net.minecraft.world.level.MoonPhase;
 import org.joml.Vector3f;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
@@ -53,7 +57,8 @@ public final class RtComposite {
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
     // + flags(@192): P6.1 bit 0 = camera submerged, bit 1 = PBR BRDF enabled
     // + P6.3 dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
-    private static final int WORLD_PUSH_SIZE = 256;
+    // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
+    private static final int WORLD_PUSH_SIZE = 320;
     private static final int GUIDE_COUNT = 7; // P4/RR guide buffers bound at world-pipeline bindings 3..9
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
@@ -80,6 +85,11 @@ public final class RtComposite {
     private static final float SUN_NOON_SOUTH_TILT = (float) Math.toRadians(Double.parseDouble(System.getProperty("upscaler.rt.sunNoonSouthDeg", "0.0")));
     private static final float SUN_NOON_Y = Mth.cos(SUN_NOON_SOUTH_TILT);
     private static final float SUN_NOON_Z = Mth.sin(SUN_NOON_SOUTH_TILT);
+    // Celestial rotation axis (the pole the sun/moon arc about): perpendicular to the east-west arc,
+    // tilted by SUN_NOON_SOUTH_TILT. Pushed so the sky shader can build the sun/moon square's tangent
+    // frame (right = travel direction) and wheel the starfield. = normalize(noonDir x sunriseDir).
+    private static final float CELESTIAL_AXIS_Y = -SUN_NOON_Z;
+    private static final float CELESTIAL_AXIS_Z = SUN_NOON_Y;
     /**
      * P4.2b RT trace scale: the path tracer + guide buffers run at this fraction of display resolution
      * and DLSS-RR upscales to display. Only applied when {@link RtDlssRr#ENABLED}; the no-RR reference
@@ -266,7 +276,7 @@ public final class RtComposite {
         if (worldPipeline == null) {
             worldPipeline = RtPipeline.create(ctx, "world.rgen.spv",
                     new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
-                    Long.BYTES, true, GUIDE_COUNT, RtEntityTextures.MAX_TEXTURES, RtMaterials.ENABLED);
+                    Long.BYTES, true, GUIDE_COUNT, RtEntityTextures.MAX_TEXTURES, RtMaterials.ENABLED, true);
             // P6.4: per-frame push data now lives in this BDA ring; the pipeline only pushes its address.
             if (pushRing == null) {
                 pushRing = new RtBuffer[PUSH_RING];
@@ -320,7 +330,25 @@ public final class RtComposite {
             worldPipeline.setBlockSpecAtlas(specView != 0L ? specView : atlasView, sampler);
             worldPipeline.setBlockNormalAtlas(normalView != 0L ? normalView : atlasView, sampler);
         }
+        // Sky rewrite: bind the vanilla celestials atlas (sun + moon phases) for world.rmiss. The view
+        // handle is stable across frames; the shader only samples it inside the sun/moon discs (sky
+        // directions), so the block-atlas fallback is never read if the celestials atlas isn't ready.
+        if (worldPipeline.hasSkyAtlas()) {
+            long celView = celestialsAtlasView();
+            worldPipeline.setSkyAtlas(celView != 0L ? celView : atlasView, sampler);
+        }
         RtTerrain.markAllDirty();
+    }
+
+    /** Vulkan image-view of the vanilla celestials atlas (sun + moon-phase sprites), or 0 if unavailable. */
+    private static long celestialsAtlasView() {
+        try {
+            GpuTextureView view = Minecraft.getInstance().getAtlasManager()
+                    .getAtlasOrThrow(AtlasIds.CELESTIALS).getTextureView();
+            return vkImageView(view);
+        } catch (Exception e) {
+            return 0L;
+        }
     }
 
     /**
@@ -618,6 +646,7 @@ public final class RtComposite {
      */
     private void writeSky(ByteBuffer push) {
         float sunX, sunY, sunZ, dayFactor, lx, ly, lz, rr, rg, rb, lightRadius;
+        float moonX, moonY, moonZ, moonPhase, starAngle, starBrightness;
         Minecraft mc = Minecraft.getInstance();
         if (!DYNAMIC_SKY || mc.level == null) {
             Vector3f s = new Vector3f(0.35f, 0.9f, 0.25f).normalize();
@@ -625,6 +654,8 @@ public final class RtComposite {
             lx = s.x; ly = s.y; lz = s.z;
             rr = 4.2f; rg = 4.0f; rb = 3.6f; // P3.1a SUN_RADIANCE
             lightRadius = SOFT_SHADOWS ? SUN_ANGULAR_RADIUS : 0f;
+            // Fixed-sky A/B: park the moon opposite the sun, full phase, no stars (daylit).
+            moonX = -s.x; moonY = -s.y; moonZ = -s.z; moonPhase = 0f; starAngle = 0f; starBrightness = 0f;
         } else {
             float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
             var probe = mc.gameRenderer.mainCamera().attributeProbe();
@@ -633,7 +664,13 @@ public final class RtComposite {
             float sunNoon = Mth.cos(sunAngle);
             sunX = -Mth.sin(sunAngle); sunY = SUN_NOON_Y * sunNoon; sunZ = SUN_NOON_Z * sunNoon;
             float moonNoon = Mth.cos(moonAngle);
-            float mx = -Mth.sin(moonAngle), my = SUN_NOON_Y * moonNoon, mz = SUN_NOON_Z * moonNoon;
+            moonX = -Mth.sin(moonAngle); moonY = SUN_NOON_Y * moonNoon; moonZ = SUN_NOON_Z * moonNoon;
+            moonPhase = probe.getValue(EnvironmentAttributes.MOON_PHASE, partial).index(); // 0 full .. 4 new
+            // Stars: use Minecraft's actual celestial rotation + brightness (the same values vanilla's
+            // SkyRenderer uses), so the starfield wheels about the celestial pole tied to world time and
+            // fades in/out at dusk/dawn exactly like vanilla. STAR_ANGLE is in degrees → radians.
+            starAngle = probe.getValue(EnvironmentAttributes.STAR_ANGLE, partial) * (float) (Math.PI / 180.0);
+            starBrightness = probe.getValue(EnvironmentAttributes.STAR_BRIGHTNESS, partial);
             dayFactor = smoothstep(-0.08f, 0.10f, sunY);
             if (sunY > 0.0f) {
                 // Sun: fades out as it sets; warm at the horizon, white overhead.
@@ -646,10 +683,12 @@ public final class RtComposite {
                 rb = Mth.lerp(warmth, 0.18f, 0.90f) * sunPeak * strength;
                 lightRadius = SOFT_SHADOWS ? SUN_ANGULAR_RADIUS : 0f;
             } else {
-                // Moon: dim cool light, fading in as the sun drops below the horizon.
+                // Moon: dim cool light, fading in as the sun drops below the horizon. Scaled by the lit
+                // fraction so a new moon gives near-zero moonlight (matches the procedural disc shape).
                 float moonStrength = 1.0f - dayFactor;
-                float moonPeak = 0.30f;
-                lx = mx; ly = my; lz = mz;
+                float litFraction = 1.0f - Math.abs(moonPhase - 4.0f) / 4.0f; // 0 new .. 1 full
+                float moonPeak = 0.30f * (0.15f + 0.85f * litFraction);
+                lx = moonX; ly = moonY; lz = moonZ;
                 rr = 0.30f * moonPeak * moonStrength;
                 rg = 0.36f * moonPeak * moonStrength;
                 rb = 0.55f * moonPeak * moonStrength;
@@ -658,7 +697,33 @@ public final class RtComposite {
         }
         push.putFloat(208, sunX); push.putFloat(212, sunY); push.putFloat(216, sunZ); push.putFloat(220, dayFactor);
         push.putFloat(224, lx); push.putFloat(228, ly); push.putFloat(232, lz); push.putFloat(236, lightRadius);
-        push.putFloat(240, rr); push.putFloat(244, rg); push.putFloat(248, rb); push.putFloat(252, 0f);
+        push.putFloat(240, rr); push.putFloat(244, rg); push.putFloat(248, rb); push.putFloat(252, starBrightness);
+        // Sky rewrite: moon direction + phase, celestial axis + star rotation angle (real world time).
+        push.putFloat(256, moonX); push.putFloat(260, moonY); push.putFloat(264, moonZ); push.putFloat(268, moonPhase);
+        push.putFloat(272, 0f); push.putFloat(276, CELESTIAL_AXIS_Y); push.putFloat(280, CELESTIAL_AXIS_Z); push.putFloat(284, starAngle);
+        writeCelestialUv(push, moonPhase); // sunUv@288 + moonUv@304 (vanilla celestials-atlas sprite rects)
+    }
+
+    /**
+     * Push the celestials-atlas UV rects (u0,v0,u1,v1) for the sun sprite and the current moon-phase
+     * sprite, so world.rmiss can sample the real vanilla textures on the discs. Atlas-not-ready (early
+     * boot / no resources) leaves full-range UVs and the shader's block-atlas fallback covers it.
+     */
+    private void writeCelestialUv(ByteBuffer push, float moonPhaseIndex) {
+        float su0 = 0f, sv0 = 0f, su1 = 1f, sv1 = 1f;
+        float mu0 = 0f, mv0 = 0f, mu1 = 1f, mv1 = 1f;
+        try {
+            TextureAtlas atlas = Minecraft.getInstance().getAtlasManager().getAtlasOrThrow(AtlasIds.CELESTIALS);
+            TextureAtlasSprite sun = atlas.getSprite(Identifier.withDefaultNamespace("sun"));
+            su0 = sun.getU0(); sv0 = sun.getV0(); su1 = sun.getU1(); sv1 = sun.getV1();
+            MoonPhase mp = MoonPhase.values()[Math.clamp((int) moonPhaseIndex, 0, MoonPhase.COUNT - 1)];
+            TextureAtlasSprite moon = atlas.getSprite(Identifier.withDefaultNamespace("moon/" + mp.getSerializedName()));
+            mu0 = moon.getU0(); mv0 = moon.getV0(); mu1 = moon.getU1(); mv1 = moon.getV1();
+        } catch (Exception ignored) {
+            // celestials atlas not yet loaded — keep full-range UVs (fallback texture is the block atlas)
+        }
+        push.putFloat(288, su0); push.putFloat(292, sv0); push.putFloat(296, su1); push.putFloat(300, sv1);
+        push.putFloat(304, mu0); push.putFloat(308, mv0); push.putFloat(312, mu1); push.putFloat(316, mv1);
     }
 
     /** Hermite smoothstep matching GLSL semantics (0 below edge0, 1 above edge1). */

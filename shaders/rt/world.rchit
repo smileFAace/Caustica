@@ -90,6 +90,7 @@ struct Payload {
     float roughness; // P6.1: perceptual roughness for the GGX BRDF
     float metalness; // P6.1: 0 = dielectric, 1 = conductor
     vec3 f0;         // P6.2a: specular reflectance at normal incidence (dielectric 0.04 / LabPBR / metal)
+    float showCelestial; // sky-disc gate (raygen-set, read by world.rmiss); unused here, kept for layout match
 };
 layout(location = 0) rayPayloadInEXT Payload payload;
 hitAttributeEXT vec2 attribs;

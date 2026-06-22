@@ -87,10 +87,11 @@ public final class RtPipeline {
     // P6.2a/b: descriptor bindings of the LabPBR _s / _n atlas combined-image-samplers, or -1 if absent.
     private final int specAtlasBinding;
     private final int normalAtlasBinding;
+    private final int skyAtlasBinding;
     private boolean destroyed;
 
     private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding,
-                       long bindlessLayout, long bindlessPool, long bindlessSet, int specAtlasBinding, int normalAtlasBinding) {
+                       long bindlessLayout, long bindlessPool, long bindlessSet, int specAtlasBinding, int normalAtlasBinding, int skyAtlasBinding) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
@@ -109,6 +110,7 @@ public final class RtPipeline {
         this.bindlessSet = bindlessSet;
         this.specAtlasBinding = specAtlasBinding;
         this.normalAtlasBinding = normalAtlasBinding;
+        this.skyAtlasBinding = skyAtlasBinding;
     }
 
     /**
@@ -119,7 +121,7 @@ public final class RtPipeline {
      * images at bindings 3.. (the P4/RR guide buffers);
      * write them with {@link #setExtraStorageImage}.
      */
-    public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages, int bindlessTextures, boolean blockMaterialAtlases) {
+    public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages, int bindlessTextures, boolean blockMaterialAtlases, boolean skyAtlas) {
         VkDevice vk = ctx.vk();
         boolean hasAhit = rahit != null;
         String label = "world RT pipeline";
@@ -132,7 +134,11 @@ public final class RtPipeline {
             int specBinding = blockMaterialAtlases ? materialBase : -1;
             int normalBinding = blockMaterialAtlases ? materialBase + 1 : -1;
             int materialSamplers = blockMaterialAtlases ? 2 : 0;
-            int bindingCount = firstExtraBinding + extraStorageImages + materialSamplers;
+            // Sky rewrite: the vanilla celestials atlas (sun + moon phases), sampled by world.rmiss to
+            // draw the sun/moon discs. One combined image sampler after the material atlases.
+            int skyBinding = skyAtlas ? materialBase + materialSamplers : -1;
+            int skySamplers = skyAtlas ? 1 : 0;
+            int bindingCount = firstExtraBinding + extraStorageImages + materialSamplers + skySamplers;
             VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(bindingCount, stack);
             binds.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
@@ -153,13 +159,17 @@ public final class RtPipeline {
                 binds.get(normalBinding).binding(normalBinding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                         .descriptorCount(1).stageFlags(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR);
             }
+            if (skyAtlas) {
+                binds.get(skyBinding).binding(skyBinding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                        .descriptorCount(1).stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR);
+            }
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout");
             long dsl = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
 
-            int combinedSamplers = (withAtlasSampler ? 1 : 0) + materialSamplers; // block atlas + _s/_n atlases
+            int combinedSamplers = (withAtlasSampler ? 1 : 0) + materialSamplers + skySamplers; // block atlas + _s/_n + celestials
             int poolSizeCount = 2 + (combinedSamplers > 0 ? 1 : 0);
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(poolSizeCount, stack);
             poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(RING);
@@ -226,9 +236,12 @@ public final class RtPipeline {
 
             VkPipelineLayoutCreateInfo plci = VkPipelineLayoutCreateInfo.calloc(stack).sType$Default()
                     .pSetLayouts(bindlessTextures > 0 ? stack.longs(dsl, bindlessLayout) : stack.longs(dsl));
-            // Push constants are visible to raygen + closest-hit (+ any-hit when present). vkCmdPushConstants
-            // must be called with exactly these stages, so store them for trace().
+            // Push constants are visible to raygen + closest-hit + miss (+ any-hit when present).
+            // vkCmdPushConstants must be called with exactly these stages, so store them for trace().
+            // Miss reads pc for the dynamic sky (sky moved from rgen into world.rmiss); since the push is
+            // just the 8-byte BDA address (P6.4), widening the stage mask is the whole cost — no gotcha #3.
             int pcStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                    | VK_SHADER_STAGE_MISS_BIT_KHR
                     | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
             if (pushConstantSize > 0) {
                 VkPushConstantRange.Buffer pcr = VkPushConstantRange.calloc(1, stack)
@@ -318,7 +331,7 @@ public final class RtPipeline {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
             return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, pushConstantSize, pcStages, firstExtraBinding,
-                    bindlessLayout, bindlessPool, bindlessSet, specBinding, normalBinding);
+                    bindlessLayout, bindlessPool, bindlessSet, specBinding, normalBinding, skyBinding);
         }
     }
 
@@ -390,6 +403,15 @@ public final class RtPipeline {
     /** Bind the LabPBR {@code _n} (normal) atlas — see {@link #setBlockSpecAtlas}. */
     public void setBlockNormalAtlas(long imageView, long sampler) {
         writeAtlasBinding(normalAtlasBinding, imageView, sampler);
+    }
+
+    /** Bind the vanilla celestials atlas (sun + moon phases), sampled by world.rmiss for the discs. */
+    public void setSkyAtlas(long imageView, long sampler) {
+        writeAtlasBinding(skyAtlasBinding, imageView, sampler);
+    }
+
+    public boolean hasSkyAtlas() {
+        return skyAtlasBinding >= 0;
     }
 
     public boolean hasBlockMaterialAtlases() {
