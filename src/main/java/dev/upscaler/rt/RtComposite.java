@@ -561,6 +561,7 @@ public final class RtComposite {
             // view handle is stable, so no re-bind needed). Before the trace records, like uploadPending.
             if (RtMaterials.ENABLED) {
                 RtBlockMaterials.INSTANCE.flush();
+                RtEntityMaterials.INSTANCE.flushAll(); // block-entity parallel _s/_n blitted during capture
             }
             // Build the entity BLAS this frame, then the TLAS that references them (+ the already-built
             // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired

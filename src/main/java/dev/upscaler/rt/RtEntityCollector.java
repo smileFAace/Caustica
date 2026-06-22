@@ -76,10 +76,19 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // the ModelPart 0..1 UVs into the sprite's region. Mobs use a full texture (sprite == null).
         capture.currentBlockAtlas = false; // model bodies use per-type bindless _s/_n, not the block atlas
         if (sprite != null) {
-            capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation());
-            capture.currentHasS = false; // atlas-sourced (block-entity sprites) have no per-type _n/_s
-            capture.currentHasN = false;
             capture.setUvRemap(sprite.getU0(), sprite.getV0(), sprite.getU1(), sprite.getV1());
+            if (TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
+                // A block entity drawing from the block atlas (rare) → reuse the terrain _s/_n atlases.
+                capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation());
+                setBlockMaterial(sprite);
+            } else {
+                // Block-entity sprite atlas (chest/sign/bed/shulker/banner/…): bind its parallel _s/_n into
+                // the bindless slot and flag per-sprite presence → world.rchit's bindless material path.
+                capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForBlockEntityAtlas(sprite.atlasLocation());
+                int flags = RtEntityMaterials.INSTANCE.ensure(sprite);
+                capture.currentHasS = (flags & RtParallelAtlas.HAS_S) != 0;
+                capture.currentHasN = (flags & RtParallelAtlas.HAS_N) != 0;
+            }
         } else {
             // Mobs use a per-type texture — pick up its LabPBR _n/_s presence for the prim flags (P6.2c).
             int slot = RtEntityTextures.INSTANCE.slotFor(renderType);

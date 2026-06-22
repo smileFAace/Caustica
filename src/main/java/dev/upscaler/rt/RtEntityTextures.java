@@ -69,6 +69,9 @@ public final class RtEntityTextures {
     // file). Seeded with the block atlas = slot 0 (also the fallback). Items use a separate item atlas.
     private final Map<Identifier, Integer> atlasSlotCache = new HashMap<>();
     private final List<Pending> pending = new ArrayList<>(); // slots resolved this frame, awaiting upload
+    // Atlas slots whose parallel LabPBR _s/_n (RtEntityMaterials, for block entities) have been bound into
+    // bindless bindings 1/2 — bind once per atlas slot. Cleared on reset (the bindless set is recreated).
+    private final java.util.Set<Integer> atlasMaterialBound = new java.util.HashSet<>();
     private int nextSlot = 1;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
@@ -167,6 +170,33 @@ public final class RtEntityTextures {
     }
 
     /**
+     * Like {@link #slotForAtlas}, but for a <b>block-entity</b> sprite atlas (chest/sign/bed/…): also binds
+     * that atlas's parallel LabPBR {@code _s}/{@code _n} ({@link RtEntityMaterials}) into bindless bindings
+     * 1/2 at the same slot, so the hit shader's per-type material path samples them at the captured atlas
+     * UV. Bound once per slot (the parallel-atlas view handle is stable; later sprite blits flush into the
+     * same texture). Retried each frame until the source atlas is ready. Block-atlas geometry uses the
+     * fixed terrain atlases instead, so callers route the block atlas elsewhere — never here.
+     */
+    public int slotForBlockEntityAtlas(Identifier atlasLocation) {
+        int slot = slotForAtlas(atlasLocation);
+        if (ENTITY_PBR && slot > 0 && !atlasMaterialBound.contains(slot)) {
+            RtParallelAtlas pa = RtEntityMaterials.INSTANCE.atlasFor(atlasLocation);
+            if (pa != null) {
+                atlasMaterialBound.add(slot);
+                long nView = pa.viewN();
+                long sView = pa.viewS();
+                if (nView != 0L) {
+                    pending.add(new Pending(1, slot, nView));
+                }
+                if (sView != 0L) {
+                    pending.add(new Pending(2, slot, sView));
+                }
+            }
+        }
+        return slot;
+    }
+
+    /**
      * Map a resolved image-view handle to a stable bindless slot, allocating one on first sight (queued
      * for upload via {@link #uploadPending}). Returns 0 (fallback) when the view is unresolved or the
      * array is full. Deduping by handle is what bounds slot use: distinct render types backed by the same
@@ -206,6 +236,8 @@ public final class RtEntityTextures {
         viewSlotCache.clear();
         atlasSlotCache.clear();
         atlasSlotCache.put(TextureAtlas.LOCATION_BLOCKS, 0); // block atlas = the slot-0 fallback
+        atlasMaterialBound.clear();
+        RtEntityMaterials.INSTANCE.reset(); // block-entity parallel _s/_n atlases are slot-bound → rebuild in lockstep
         pending.clear();
         nextSlot = 1;
         for (DynamicTexture dt : materialCache.values()) {
