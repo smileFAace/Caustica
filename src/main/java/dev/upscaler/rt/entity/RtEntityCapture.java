@@ -1,6 +1,7 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.entity;
 
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import dev.upscaler.rt.material.RtMaterials;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
@@ -9,27 +10,26 @@ import org.joml.Vector3f;
 import org.joml.Vector3fc;
 
 /**
- * P5.1b-2 capture infrastructure: a {@link VertexConsumer} that records the posed entity geometry
- * vanilla emits — exactly the same bulk {@code addVertex(x,y,z,color,u,v,overlay,light,nx,ny,nz)} that
- * {@code ModelPart.Cube.compile} calls (4 verts/quad → 2 triangles), so this mirrors the fluid-capture
- * pattern. {@link RtEntityCollector} drives it by calling {@code model.renderToBuffer(pose, this, …)}.
+ * A {@link VertexConsumer} that records the posed entity geometry vanilla emits — exactly the same bulk
+ * {@code addVertex(x,y,z,color,u,v,overlay,light,nx,ny,nz)} that {@code ModelPart.Cube.compile} calls
+ * (4 verts/quad → 2 triangles). {@link RtEntityCollector} drives it by calling
+ * {@code model.renderToBuffer(pose, this, …)}.
  *
- * <p>The accumulators use the SAME layout as terrain's {@code SectionMesh} (positions, indices, atlas
- * UV, per-prim {@code {normal.xyz, emission}, {tint.rgb, 0}}) so the GPU-side rework (P5.1b-2 step 2)
- * can upload + BLAS them with the existing terrain machinery. Until entity textures land (P5.1b-2b) the
- * tint carries the model's vertex colour (white → grey-lit) and UVs are kept for later.
+ * <p>Accumulators use the same layout as terrain's {@code SectionMesh} (positions, indices, atlas UV,
+ * per-prim {@code {normal.xyz, emission}, {tint.rgb, texSlot}, {rough, metal, 0, 0}}) so entities
+ * share the terrain upload + BLAS path verbatim.
  */
 public final class RtEntityCapture implements VertexConsumer {
     final FloatArrayList verts = new FloatArrayList();   // 3 floats/vertex (capture-space position)
     final IntArrayList idx = new IntArrayList();         // 3 indices/triangle
-    final FloatArrayList uvList = new FloatArrayList();  // 2 floats/vertex (entity-texture UV, for P5.1b-2b)
+    final FloatArrayList uvList = new FloatArrayList();  // 2 floats/vertex (entity-texture UV)
     final FloatArrayList prim = new FloatArrayList();    // 12 floats/triangle: normal.xyz+0, tint.rgb+texSlot, mat.{rough,metal,0,0}
 
-    // P5.1b-2b: the bindless texture slot for the geometry currently being submitted (set by the
-    // collector per submitModel, so body + feature layers get their own texture). Stored per-prim in
-    // tint.w; the hit shader samples entityTex[texSlot].
+    // Bindless texture slot for the geometry currently being submitted (set by the collector per
+    // submitModel, so body + feature layers get their own texture). Stored per-prim in tint.w;
+    // the hit shader samples entityTex[texSlot].
     int currentTexSlot;
-    // P6.2c: whether the current submission's bindless slot has a LabPBR _s / _n map (→ prim mat.z/mat.w).
+    // Whether the current submission's bindless slot has a LabPBR _s / _n map (→ prim mat.z/mat.w).
     // Set by the collector per submission; mobs (per-type textures) may have them, atlas-sourced quads don't.
     boolean currentHasS;
     boolean currentHasN;
@@ -44,9 +44,9 @@ public final class RtEntityCapture implements VertexConsumer {
     // content (slime core, the sulfur cube's contained block) shows through the shell. Set by the collector
     // per submission (model bodies only — block/item/particle paths force it false).
     boolean currentTranslucent;
-    // P5.1b-2f: when a model textures from an atlas SPRITE (block entities: chests/signs/beds via a
-    // Material), its ModelPart UVs are 0..1 in a virtual texture and must be remapped into the sprite's
-    // atlas region — the work vanilla's sprite-coordinate-expander VertexConsumer does, which we bypass.
+    // When a model textures from an atlas sprite (block entities: chests/signs/beds via a Material),
+    // its ModelPart UVs are 0..1 in a virtual texture and must be remapped into the sprite's atlas
+    // region — the work vanilla's sprite-coordinate-expander VertexConsumer does, which we bypass.
     // Off for full-texture models (mobs, sprite == null) and for baked quads (already atlas-space).
     private boolean uvRemap;
     private float uvU0, uvV0, uvDU, uvDV;
@@ -56,7 +56,7 @@ public final class RtEntityCapture implements VertexConsumer {
     private final float[] qu = new float[4], qv = new float[4];
     private final float[] qnx = new float[4], qny = new float[4], qnz = new float[4];
     private final int[] qcol = new int[4];
-    private final Vector3f scratch = new Vector3f(); // P5.1b-2d/e baked-quad position transform
+    private final Vector3f scratch = new Vector3f(); // baked-quad position transform scratch
 
     /** Clear all accumulators for a fresh entity capture. */
     public void reset() {
@@ -165,8 +165,7 @@ public final class RtEntityCapture implements VertexConsumer {
             ny /= len;
             nz /= len;
         }
-        // Vertex colour as a flat per-prim tint (ARGB → rgb). White (-1) for most models → grey when lit;
-        // real per-texture colour arrives with entity textures (P5.1b-2b).
+        // Vertex colour as a flat per-prim tint (ARGB → rgb). White (-1) for most models → grey when lit.
         int c = qcol[0];
         float tr = ((c >> 16) & 0xFF) * (1f / 255f);
         float tg = ((c >> 8) & 0xFF) * (1f / 255f);
@@ -181,11 +180,11 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(tr);
             prim.add(tg);
             prim.add(tb);
-            prim.add((float) currentTexSlot); // tint.w = bindless texture slot (P5.1b-2b)
-            prim.add(RtMaterials.ENTITY_ROUGH); // P6.1: entities default to a matte dielectric
+            prim.add((float) currentTexSlot); // tint.w = bindless texture slot
+            prim.add(RtMaterials.ENTITY_ROUGH); // entities default to a matte dielectric
             prim.add(0f);                       // metalness
-            // mat.z / mat.w: LabPBR _s / _n presence + source. 0 = none, 1 = per-type bindless entity atlas
-            // (P6.2c mobs), 2 = block atlas (block-like entities; sampled from the terrain _s/_n atlases).
+            // mat.z / mat.w: LabPBR _s / _n presence + source. 0 = none, 1 = per-type bindless entity atlas,
+            // 2 = block atlas (block-like entities; sampled from the terrain _s/_n atlases).
             float matSource = currentBlockAtlas ? 2f : 1f;
             prim.add(currentHasS ? matSource : 0f); // mat.z
             prim.add(currentHasN ? matSource : 0f); // mat.w

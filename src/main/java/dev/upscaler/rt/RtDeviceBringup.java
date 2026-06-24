@@ -37,7 +37,7 @@ import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEV
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPACITY_MICROMAP_PROPERTIES_EXT;
 
 /**
- * P0 — RT bring-up. Enables the hardware ray-tracing device extensions and their
+ * RT device bring-up. Enables the hardware ray-tracing device extensions and their
  * feature structs on vanilla's Blaze3D device at {@code vkCreateDevice} time.
  *
  * <p>Vanilla assembles a {@code VkPhysicalDeviceFeatures2} pNext chain from the
@@ -68,9 +68,9 @@ public final class RtDeviceBringup {
 
     /**
      * The device extensions RT needs (BDA/descriptor-indexing/SPIR-V 1.4 are core on 1.4).
-     * P6.2b: {@code ray_tracing_position_fetch} lets the closest-hit read the hit triangle's vertex
-     * positions ({@code gl_HitTriangleVertexPositionsEXT}) for the normal-map TBN, avoiding a positions
-     * buffer plumbed through the geometry tables. Supported on all RTX GPUs (the project's target).
+     * {@code ray_tracing_position_fetch} lets the closest-hit read hit triangle vertex positions
+     * ({@code gl_HitTriangleVertexPositionsEXT}) for the normal-map TBN, avoiding a positions buffer
+     * plumbed through the geometry tables. Supported on all RTX GPUs (the project's target).
      */
     public static final List<String> RT_EXTENSIONS = List.of(
             VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
@@ -176,16 +176,16 @@ public final class RtDeviceBringup {
         VulkanPNextStruct rtStruct = new VulkanPNextStruct(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
                 VkPhysicalDeviceRayTracingPipelineFeaturesKHR.SIZEOF);
-        // P6.2b: ray-tracing position fetch (gl_HitTriangleVertexPositionsEXT in the closest-hit).
+        // Ray-tracing position fetch (gl_HitTriangleVertexPositionsEXT in the closest-hit).
         VulkanPNextStruct posFetchStruct = new VulkanPNextStruct(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR,
                 VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.SIZEOF);
         // bufferDeviceAddress merges into vanilla's existing Vulkan12Features struct.
         features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "bufferDeviceAddress",
                 VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS));
-        // P5.1b-2b bindless entity textures: a runtime-sized sampler2D[] indexed non-uniformly in the
-        // hit shader, with partially-bound + update-after-bind slots (a growing per-RenderType registry).
-        // Core on the VK 1.4 device; just needs enabling alongside bufferDeviceAddress on the same struct.
+        // Bindless entity textures: a runtime-sized sampler2D[] indexed non-uniformly in the hit shader,
+        // with partially-bound + update-after-bind slots (a growing per-RenderType registry). Core on the
+        // VK 1.4 device; just needs enabling alongside bufferDeviceAddress on the same struct.
         features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "runtimeDescriptorArray",
                 VkPhysicalDeviceVulkan12Features.RUNTIMEDESCRIPTORARRAY));
         features.add(new VulkanFeature(VulkanBackend.VK12_FEATURES_STRUCT, "shaderSampledImageArrayNonUniformIndexing",
@@ -226,7 +226,7 @@ public final class RtDeviceBringup {
     /**
      * Post-creation verification: confirm the RT entry points actually loaded on the new
      * device and log the RT pipeline / acceleration-structure limits. If this logs "OK",
-     * the device truly came up RT-capable — the P0 device half is proven.
+     * the device truly came up RT-capable.
      */
     public static void probe(VkDevice device) {
         if (!rtRequested) {

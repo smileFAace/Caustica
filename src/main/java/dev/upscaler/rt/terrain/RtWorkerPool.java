@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.terrain;
 
 import dev.upscaler.UpscalerMod;
 
@@ -12,14 +12,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Shared daemon thread pool for CPU-heavy RT work that must stay off the render thread — terrain
- * tessellation today (see {@link RtTerrain}), LOD build / atlas stitching later. Jobs submitted here
- * must be pure CPU: <b>no Vulkan calls and no shared mutable state</b> (the graphics queue is owned by
- * the render thread, and queue submission stays single-threaded). Results are collected back on the
- * render thread via the returned {@link Future}.
+ * tessellation, with LOD build / atlas stitching as future candidates. Jobs must be pure CPU:
+ * no Vulkan calls and no shared mutable state (the graphics queue is render-thread-owned, and
+ * queue submission stays single-threaded). Results are collected on the render thread via the
+ * returned {@link Future}.
  *
- * <p>Sized at {@code -Dupscaler.rt.workerThreads} (default {@code clamp(cores/2, 1, 4)}) to leave cores
- * for Minecraft's own chunk meshers. Core threads time out when idle so the pool costs nothing between
- * bursts; threads are daemon so they never block JVM exit.
+ * <p>Sized at {@code -Dupscaler.rt.workerThreads} (default {@code clamp(cores/2, 1, 4)}) to leave
+ * cores for Minecraft's own chunk meshers. Core threads time out when idle; all are daemon so they
+ * never block JVM exit.
  */
 public final class RtWorkerPool {
     public static final RtWorkerPool INSTANCE = new RtWorkerPool();
@@ -28,8 +28,7 @@ public final class RtWorkerPool {
 
     private ThreadPoolExecutor exec;
 
-    private RtWorkerPool() {
-    }
+    private RtWorkerPool() {}
 
     private static int resolveThreads() {
         int def = Math.clamp(Runtime.getRuntime().availableProcessors() / 2, 1, 4);
@@ -40,12 +39,11 @@ public final class RtWorkerPool {
         if (exec == null) {
             ThreadFactory factory = new ThreadFactory() {
                 private final AtomicInteger n = new AtomicInteger();
-
                 @Override
                 public Thread newThread(Runnable r) {
                     Thread t = new Thread(r, "rt-worker-" + n.incrementAndGet());
                     t.setDaemon(true);
-                    t.setPriority(Thread.NORM_PRIORITY - 1); // yield to the render + MC mesher threads
+                    t.setPriority(Thread.NORM_PRIORITY - 1);
                     return t;
                 }
             };

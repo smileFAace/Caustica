@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.pipeline;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -28,6 +28,12 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
 
+import dev.upscaler.rt.RtContext;
+import dev.upscaler.rt.RtDebugLabels;
+import dev.upscaler.rt.RtDeviceBringup;
+import dev.upscaler.rt.accel.RtAccel;
+import dev.upscaler.rt.accel.RtBuffer;
+
 import static dev.upscaler.rt.RtContext.check;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -49,17 +55,17 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupH
  * An RT pipeline with an SBT of {raygen + N miss + one triangle hit group} and a descriptor
  * set of {binding 0 = TLAS, binding 1 = storage image}. Built from SPIR-V resources. Update the
  * bindings with {@link #setTlas}/{@link #setStorageImage}, then {@link #trace}. Reusable across
- * the triangle spike and P1 terrain (extend the descriptor layout there as needed). Multiple miss
+ * the triangle spike and terrain (extend the descriptor layout there as needed). Multiple miss
  * shaders (e.g. a primary sky miss at index 0 plus a shadow/visibility miss at index 1) are
  * supported by passing an array; {@code traceRayEXT}'s {@code missIndex} selects among them.
  */
 public final class RtPipeline {
     private static final String SHADER_DIR = "/upscaler/rt/";
-    /** P6.2c: bindless entity-texture channels per slot — binding 0 = albedo, 1 = LabPBR _n, 2 = _s. */
+    /** Bindless entity-texture channels per slot — binding 0 = albedo, 1 = LabPBR _n, 2 = _s. */
     public static final int BINDLESS_BINDINGS = 3;
     // A ring of descriptor sets: setTlas writes the next slot (long-unused) rather than mutating the
     // slot in-flight frames are still reading, so the TLAS can be swapped without a device drain.
-    // P5.1a rebuilds + rebinds the TLAS EVERY frame (dynamic content), so a slot is reused every RING
+    // The TLAS is rebuilt + rebound every frame (dynamic content), so a slot is reused every RING
     // frames; RING must exceed the max frames-in-flight (vanilla MC ≤ 3) for the reused slot to be off
     // all queues. 6 gives margin and matches the KEEP_FRAMES-style horizon used for resource frees.
     private static final int RING = 6;
@@ -77,14 +83,14 @@ public final class RtPipeline {
     private final int pushConstantSize;
     private final int pushConstantStages;
     private final int firstExtraBinding;
-    // P5.1b-2b bindless entity textures: an optional second descriptor set (set 1) holding a runtime
-    // sampler2D[] the closest-hit indexes per-prim. Single (not ringed) + update-after-bind: the
-    // RenderType→slot registry is append-only, so existing slots never change and new slots are written
-    // before the frame that uses them. 0 when the pipeline was created without bindless textures.
+    // Optional second descriptor set (set 1) holding a bindless runtime sampler2D[] the closest-hit
+    // indexes per-prim. Single (not ringed) + update-after-bind: the RenderType→slot registry is
+    // append-only, so existing slots never change and new slots are written before the frame that uses
+    // them. 0 when the pipeline was created without bindless textures.
     private final long bindlessLayout;
     private final long bindlessPool;
     private final long bindlessSet;
-    // P6.2a/b: descriptor bindings of the LabPBR _s / _n atlas combined-image-samplers, or -1 if absent.
+    // Descriptor bindings of the LabPBR _s / _n atlas combined-image-samplers, or -1 if absent.
     private final int specAtlasBinding;
     private final int normalAtlasBinding;
     private final int skyAtlasBinding;
@@ -118,7 +124,7 @@ public final class RtPipeline {
      * alpha-tested cutout geometry — it's an extra pipeline stage but not an extra SBT group, so the
      * record layout is unchanged. When present, the atlas sampler and push constants are also made
      * visible to the any-hit stage. {@code extraStorageImages} adds that many raygen-visible storage
-     * images at bindings 3.. (the P4/RR guide buffers);
+     * images at bindings 3.. (the DLSS-RR guide buffers);
      * write them with {@link #setExtraStorageImage}.
      */
     public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withAtlasSampler, int extraStorageImages, int bindlessTextures, boolean blockMaterialAtlases, boolean skyAtlas) {
@@ -127,9 +133,8 @@ public final class RtPipeline {
         String label = "world RT pipeline";
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int firstExtraBinding = withAtlasSampler ? 3 : 2;
-            // P6.2a/b: the LabPBR _s/_n atlases (combined image samplers) follow the guide images, so
-            // they start at firstExtraBinding + extraStorageImages. Sampled only by the closest-hit
-            // (material readout).
+            // The LabPBR _s/_n atlases (combined image samplers) follow the guide images, starting at
+            // firstExtraBinding + extraStorageImages. Sampled only by the closest-hit (material readout).
             int materialBase = firstExtraBinding + extraStorageImages;
             int specBinding = blockMaterialAtlases ? materialBase : -1;
             int normalBinding = blockMaterialAtlases ? materialBase + 1 : -1;
@@ -196,11 +201,11 @@ public final class RtPipeline {
                 RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, sets[i], label + " descriptor set " + i);
             }
 
-            // P5.1b-2b: optional bindless set (set 1) — a partially-bound, update-after-bind
-            // combined-image-sampler array the closest-hit samples per-prim for entity textures.
+            // Optional bindless set (set 1) — a partially-bound, update-after-bind combined-image-sampler
+            // array the closest-hit samples per-prim for entity textures.
             long bindlessLayout = 0L, bindlessPool = 0L, bindlessSet = 0L;
             if (bindlessTextures > 0) {
-                // P6.2c: BINDLESS_BINDINGS parallel arrays per slot — binding 0 = albedo, 1 = LabPBR _n,
+                // BINDLESS_BINDINGS parallel arrays per slot — binding 0 = albedo, 1 = LabPBR _n,
                 // 2 = LabPBR _s. The closest-hit samples all three at the same slot (tint.w) for entities.
                 int nb = BINDLESS_BINDINGS;
                 VkDescriptorSetLayoutBinding.Buffer bl = VkDescriptorSetLayoutBinding.calloc(nb, stack);
@@ -238,8 +243,7 @@ public final class RtPipeline {
                     .pSetLayouts(bindlessTextures > 0 ? stack.longs(dsl, bindlessLayout) : stack.longs(dsl));
             // Push constants are visible to raygen + closest-hit + miss (+ any-hit when present).
             // vkCmdPushConstants must be called with exactly these stages, so store them for trace().
-            // Miss reads pc for the dynamic sky (sky moved from rgen into world.rmiss); since the push is
-            // just the 8-byte BDA address (P6.4), widening the stage mask is the whole cost — no gotcha #3.
+            // Miss reads pc for the dynamic sky; widening the stage mask is the whole cost — no gotcha #3.
             int pcStages = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
                     | VK_SHADER_STAGE_MISS_BIT_KHR
                     | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
@@ -365,7 +369,7 @@ public final class RtPipeline {
         }
     }
 
-    /** Write an extra storage image (P4/RR guide buffer) into binding {@code firstExtraBinding + slot} across every ring slot. */
+    /** Write an extra storage image (DLSS-RR guide buffer) into binding {@code firstExtraBinding + slot} across every ring slot. */
     public void setExtraStorageImage(int slot, long imageView) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer imgInfo = VkDescriptorImageInfo.calloc(1, stack);

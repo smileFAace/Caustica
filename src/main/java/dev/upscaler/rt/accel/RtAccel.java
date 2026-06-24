@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.accel;
 
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
@@ -21,6 +21,9 @@ import org.lwjgl.vulkan.VkMicromapBuildSizesInfoEXT;
 import org.lwjgl.vulkan.VkMicromapCreateInfoEXT;
 import org.lwjgl.vulkan.VkMicromapTriangleEXT;
 import org.lwjgl.vulkan.VkMicromapUsageEXT;
+
+import dev.upscaler.rt.RtContext;
+import dev.upscaler.rt.RtDebugLabels;
 
 import java.util.List;
 
@@ -61,8 +64,7 @@ import static org.lwjgl.vulkan.KHRSynchronization2.vkCmdPipelineBarrier2KHR;
 
 /**
  * A built acceleration structure (BLAS or TLAS) plus its backing buffer. Build with the static
- * factories; free with {@link #destroy()}. This is the unit P1's chunk lifecycle manages
- * (one BLAS per section, one TLAS rebuilt per frame).
+ * factories; free with {@link #destroy()}. One BLAS per section; one TLAS rebuilt per frame.
  */
 public final class RtAccel {
     private static final long MICROMAP_INPUT_ADDRESS_ALIGNMENT = 256L;
@@ -193,9 +195,9 @@ public final class RtAccel {
         private final int triangleCount;
         private final boolean opaque;
         private final String label;
-        // P5-perf #1 (step 2): refit support. {@code updatable} = built with ALLOW_UPDATE (so it can be
-        // refit later); {@code update} = this recorded op is an in-place UPDATE (refit) rather than a full
-        // BUILD. Set for the entity refit path; false for terrain + pooled block entities.
+        // Refit support. {@code updatable} = built with ALLOW_UPDATE (so it can be refit later);
+        // {@code update} = this recorded op is an in-place UPDATE (refit) rather than a full BUILD.
+        // Set for the entity refit path; false for terrain + pooled block entities.
         private final boolean updatable;
         private final boolean update;
         // Terrain multi-geometry split (any-hit opt): one geometry per material bucket, in the fixed packed
@@ -271,13 +273,7 @@ public final class RtAccel {
     public record UpdatableBuild(PreparedBlas op, RtAccel accel, RtBuffer backing, RtBuffer scratch, long updateScratchSize) {
     }
 
-    /** Allocate a BLAS (AS + backing + scratch) and query sizes, but defer the build to {@link #recordBlasBuilds}. */
-    public static PreparedBlas prepareTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
-                                                    RtBuffer indices, int indexCount, boolean opaque) {
-        return prepareTrianglesBlas(ctx, positions, vertexCount, indices, indexCount, opaque, "terrain BLAS");
-    }
-
-    /** Allocate a labelled BLAS (AS + backing + scratch) and query sizes, deferring the build. */
+    /** Allocate a BLAS (AS + backing + scratch) and query sizes, deferring the build to {@link #recordBlasBuilds}. */
     public static PreparedBlas prepareTrianglesBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                     RtBuffer indices, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
@@ -303,11 +299,6 @@ public final class RtAccel {
      * triangles form a contiguous range. Build is deferred to {@link #recordBlasBuilds}; empty buckets are
      * omitted (their geometry isn't built), so an all-solid section is a single opaque geometry.
      */
-    public static PreparedBlas prepareTerrainBlas(RtContext ctx, RtBuffer positions, int vertexCount,
-                                                  RtBuffer indices, int[] bucketTris, String label) {
-        return prepareTerrainBlas(ctx, positions, vertexCount, indices, bucketTris, null, label);
-    }
-
     public static PreparedBlas prepareTerrainBlas(RtContext ctx, RtBuffer positions, int vertexCount,
                                                   RtBuffer indices, int[] bucketTris, OpacityMicromapInput opacityMicromapInput,
                                                   String label) {
@@ -380,12 +371,6 @@ public final class RtAccel {
      * {@link RtEntities}; the terrain path keeps {@link #prepareTrianglesBlas}.
      */
     public static PreparedBlas prepareTrianglesBlasPooled(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
-                                                          RtBuffer indices, int indexCount, boolean opaque) {
-        return prepareTrianglesBlasPooled(ctx, pool, positions, vertexCount, indices, indexCount, opaque, "pooled BLAS");
-    }
-
-    /** Pooled labelled variant of {@link #prepareTrianglesBlas}. */
-    public static PreparedBlas prepareTrianglesBlasPooled(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
                                                           RtBuffer indices, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
         String debugLabel = labelOr(label, "pooled BLAS");
@@ -403,18 +388,12 @@ public final class RtAccel {
     }
 
     /**
-     * P5-perf #1 (step 2): create a new <em>updatable</em> (ALLOW_UPDATE) BLAS sized for this mesh and a
-     * pool-backed backing buffer, and prepare its initial full BUILD. The {@code accel} + {@code backing}
-     * persist in the caller's per-entity ring (NOT released per frame); later frames refit it with {@link
-     * #refitUpdate} (cheap in-place UPDATE) while the topology is stable, and free it with {@link
-     * #destroyPooledAccel} on eviction / topology change.
+     * Create a new <em>updatable</em> (ALLOW_UPDATE) BLAS sized for this mesh and a pool-backed backing
+     * buffer, and prepare its initial full BUILD. The {@code accel} + {@code backing} persist in the
+     * caller's per-entity ring (NOT released per frame); later frames refit it with {@link #refitUpdate}
+     * (cheap in-place UPDATE) while the topology is stable, and free it with {@link #destroyPooledAccel}
+     * on eviction / topology change.
      */
-    public static UpdatableBuild prepareUpdatableBlasBuild(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
-                                                           RtBuffer indices, int indexCount, boolean opaque) {
-        return prepareUpdatableBlasBuild(ctx, pool, positions, vertexCount, indices, indexCount, opaque, "updatable BLAS");
-    }
-
-    /** Labelled variant of {@link #prepareUpdatableBlasBuild}. */
     public static UpdatableBuild prepareUpdatableBlasBuild(RtContext ctx, RtBufferPool pool, RtBuffer positions, int vertexCount,
                                                            RtBuffer indices, int indexCount, boolean opaque, String label) {
         VkDevice vk = ctx.vk();
@@ -435,17 +414,11 @@ public final class RtAccel {
     }
 
     /**
-     * P5-perf #1 (step 2): prepare an in-place refit (UPDATE) of an existing updatable BLAS with new vertex
-     * data of the SAME topology. {@code scratch} (sized {@code updateScratchSize}) and the mesh buffers are
-     * caller-owned per-frame transients; the {@code accel} persists. Records nothing on its own — returned
-     * to {@link #recordBlasBuilds} like a BUILD.
+     * Prepare an in-place refit (UPDATE) of an existing updatable BLAS with new vertex data of the SAME
+     * topology. {@code scratch} (sized {@code updateScratchSize}) and the mesh buffers are caller-owned
+     * per-frame transients; the {@code accel} persists. Records nothing on its own — returned to {@link
+     * #recordBlasBuilds} like a BUILD.
      */
-    public static PreparedBlas refitUpdate(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr,
-                                           int vertexCount, int indexCount, boolean opaque) {
-        return refitUpdate(accel, scratch, vertexAddr, indexAddr, vertexCount, indexCount, opaque, "BLAS refit");
-    }
-
-    /** Prepare a labelled in-place BLAS refit. */
     public static PreparedBlas refitUpdate(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr,
                                            int vertexCount, int indexCount, boolean opaque, String label) {
         String debugLabel = labelOr(label, "BLAS refit");
@@ -481,7 +454,7 @@ public final class RtAccel {
     }
 
     private static int buildFlags(boolean allowUpdate) {
-        // P6.2b: ALLOW_DATA_ACCESS lets the closest-hit read vertex positions from the BLAS via
+        // ALLOW_DATA_ACCESS lets the closest-hit read vertex positions from the BLAS via
         // gl_HitTriangleVertexPositionsEXT (VK_KHR_ray_tracing_position_fetch) for the normal-map TBN.
         // Applied to every BLAS (terrain/entity) AND the refit path, so the build/UPDATE flags stay
         // identical (a refit invariant) — this is the single shared flag source.
@@ -732,8 +705,7 @@ public final class RtAccel {
         return build;
     }
 
-    /** Record every prepared BLAS build into the command buffer (independent builds, no barriers between them). */
-    public static void recordBlasBuilds(VkCommandBuffer cmd, List<PreparedBlas> blas) {
+    private static void recordBlasBuilds(VkCommandBuffer cmd, List<PreparedBlas> blas) {
         for (PreparedBlas b : blas) {
             try (MemoryStack stack = MemoryStack.stackPush()) { // per-iteration: avoid 64 KB stack overflow
                 recordBlasBuild(cmd, stack, b);
@@ -757,13 +729,7 @@ public final class RtAccel {
         }
     }
 
-    /**
-     * Record a single TLAS build into the command buffer. The caller is responsible for the AS-build →
-     * ray-trace barrier before tracing (and, when BLAS are built in the same submission, the
-     * BLAS-write → AS-read barrier before this). Drives the per-frame TLAS rebuild in {@link
-     * RtComposite} that merges static terrain instances with dynamic ones.
-     */
-    public static void recordTlasBuild(VkCommandBuffer cmd, PreparedTlas tlas) {
+    private static void recordTlasBuild(VkCommandBuffer cmd, PreparedTlas tlas) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
             build.get(0).dstAccelerationStructure(tlas.accel.handle);

@@ -29,6 +29,9 @@ import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayTracingPipelinePropertiesKHR;
 import org.lwjgl.vulkan.VkSubmitInfo;
 
+import dev.upscaler.rt.accel.RtBuffer;
+import dev.upscaler.rt.accel.RtImage;
+
 import java.nio.LongBuffer;
 import java.util.function.Consumer;
 
@@ -334,7 +337,7 @@ public final class RtContext {
         }
     }
 
-    static void check(int rc, String what) {
+    public static void check(int rc, String what) {
         if (rc != VK10.VK_SUCCESS) {
             throw new IllegalStateException(what + " failed: " + rc);
         }

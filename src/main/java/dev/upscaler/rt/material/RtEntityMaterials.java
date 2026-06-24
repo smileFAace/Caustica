@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.material;
 
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.resources.Identifier;
@@ -7,28 +7,24 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * LabPBR {@code _s}/{@code _n} for <b>block entities</b> (chests, signs, beds, shulker boxes, banners, …),
- * which texture from their own dedicated sprite atlases (the chest sheet, sign sheet, …) rather than the
- * block atlas. For each such atlas we build a parallel {@code _s}/{@code _n} atlas ({@link RtParallelAtlas})
- * mirroring its layout, and bind those views into the bindless entity-material arrays at the atlas's albedo
- * slot ({@link RtEntityTextures#slotForBlockEntityAtlas}). The hit shader then samples them via the existing
- * per-type bindless path (prim {@code mat} code 1) at the captured atlas UV — no shader change.
+ * LabPBR {@code _s}/{@code _n} for block entities (chests, signs, beds, shulker boxes, banners, …),
+ * which texture from their own dedicated sprite atlases rather than the block atlas. For each such
+ * atlas a parallel {@link RtParallelAtlas} is built and its views are bound into the bindless
+ * entity-material arrays at the atlas's albedo slot. The hit shader samples them via the per-type
+ * bindless path (prim {@code mat} code 1) — no shader change.
  *
- * <p>Built lazily per atlas on first sight (block-entity atlases are few and small, so up-front
- * enumeration isn't worth it). Render-thread only ({@link RtParallelAtlas} creates/uploads GPU textures).
+ * <p>Built lazily per atlas on first sight. Render-thread only.
  */
 public final class RtEntityMaterials {
     public static final RtEntityMaterials INSTANCE = new RtEntityMaterials();
 
     private final Map<Identifier, RtParallelAtlas> atlases = new HashMap<>();
 
-    private RtEntityMaterials() {
-    }
+    private RtEntityMaterials() {}
 
     /**
-     * The parallel {@code _s}/{@code _n} atlas for a source atlas, created (and sized to the source atlas)
-     * on first sight and retried each call until the source atlas is ready. Returns null while it isn't.
-     * Render-thread only.
+     * The parallel {@code _s}/{@code _n} atlas for a source atlas, created on first sight and retried
+     * until the source atlas is ready. Returns null while it isn't. Render-thread only.
      */
     public RtParallelAtlas atlasFor(Identifier atlasLocation) {
         if (atlasLocation == null) {
@@ -45,7 +41,7 @@ public final class RtEntityMaterials {
         return pa.isReady() ? pa : null;
     }
 
-    /** The {@code HAS_S}|{@code HAS_N} presence bitmask for a block-entity sprite (0 if its atlas isn't ready). */
+    /** The {@code HAS_S}|{@code HAS_N} presence bitmask for a block-entity sprite (0 if atlas not ready). */
     public int ensure(TextureAtlasSprite sprite) {
         if (sprite == null) {
             return 0;
@@ -54,7 +50,7 @@ public final class RtEntityMaterials {
         return pa != null ? pa.ensure(sprite) : 0;
     }
 
-    /** Re-upload every block-entity atlas that gained sprites since the last flush. Pre-trace each frame. */
+    /** Re-upload every block-entity atlas that gained sprites since last flush. Pre-trace each frame. */
     public void flushAll() {
         for (RtParallelAtlas pa : atlases.values()) {
             pa.flush();

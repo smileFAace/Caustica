@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.entity;
 
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.textures.GpuTextureView;
@@ -7,6 +7,9 @@ import dev.upscaler.UpscalerMod;
 import dev.upscaler.client.SodiumCompat;
 import dev.upscaler.mixin.RenderSetupAccessor;
 import dev.upscaler.mixin.RenderTypeAccessor;
+import dev.upscaler.rt.material.RtEntityMaterials;
+import dev.upscaler.rt.material.RtParallelAtlas;
+import dev.upscaler.rt.pipeline.RtPipeline;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
@@ -26,10 +29,10 @@ import java.util.Optional;
 import java.util.WeakHashMap;
 
 /**
- * P5.1b-2b: resolves the texture backing an entity {@link RenderType} to a Vulkan image-view handle,
- * for the bindless entity-texture array. Entities use per-type texture files (zombie.png, …), not the
- * block atlas, so each distinct texture maps to its own bindless slot. Slots are keyed by the resolved
- * image view rather than the {@link RenderType}: some render types are rebuilt every frame with a fresh
+ * Resolves the texture backing an entity {@link RenderType} to a Vulkan image-view handle, for the
+ * bindless entity-texture array. Entities use per-type texture files (zombie.png, …), not the block
+ * atlas, so each distinct texture maps to its own bindless slot. Slots are keyed by the resolved image
+ * view rather than the {@link RenderType}: some render types are rebuilt every frame with a fresh
  * identity (the charged-creeper energy swirl scrolls its texture transform, so {@code energySwirl()}
  * allocates a new RenderType per frame), and keying by RenderType there would leak a slot per frame
  * until the array exhausts and everything falls back to slot 0.
@@ -39,15 +42,12 @@ import java.util.WeakHashMap;
  * primary sampler is {@code "Sampler0"} ({@code "Sampler1"}/{@code "Sampler2"} are the overlay/lightmap
  * the prepared list prepends). Resolution is cached per {@code RenderType} (they are stable singletons),
  * so the prepare() cost is paid once per distinct texture.
- *
- * <p>Step b1 here is resolution only (verified by the entity probe); the bindless descriptor array +
- * slot assignment + shader sampling are step b2.
  */
 public final class RtEntityTextures {
     /** Bindless array capacity (slot 0 reserved as a fallback texture). {@code -Dupscaler.rt.maxEntityTextures}. */
     public static final int MAX_TEXTURES = Integer.getInteger("upscaler.rt.maxEntityTextures", 256);
-    /** P6.2c: resolve + bind per-type LabPBR {@code _n}/{@code _s} for entities. Toggle off to A/B the cost
-     *  (the prim flags stay 0 → the shader skips the entity material branches). {@code -Dupscaler.rt.entityPbr}. */
+    /** Resolve + bind per-type LabPBR {@code _n}/{@code _s} for entities. Toggle off to skip entity material
+     *  branches (prim flags stay 0). {@code -Dupscaler.rt.entityPbr}. */
     public static final boolean ENTITY_PBR = Boolean.parseBoolean(System.getProperty("upscaler.rt.entityPbr", "true"));
     // Declared AFTER MAX_TEXTURES: the constructor sizes per-slot arrays to MAX_TEXTURES, so that constant
     // must be initialized first (static fields init in textual order; a length-0 array would result otherwise).
@@ -76,9 +76,9 @@ public final class RtEntityTextures {
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
 
-    // P6.2c entity LabPBR: per-type _n/_s textures cached by resource Identifier (null = known-missing),
-    // closed on reset(). Per-slot presence (→ the entity prim's mat.w/mat.z) + a guard so a slot's _n/_s
-    // are resolved once (slots can be re-seen via the same shared texture handle every frame).
+    // Entity LabPBR: per-type _n/_s textures cached by resource Identifier (null = known-missing), closed
+    // on reset(). Per-slot presence (→ prim mat.w/mat.z) + a guard so a slot's _n/_s are resolved once
+    // (slots can be re-seen via the same shared texture handle every frame).
     private final Map<Identifier, DynamicTexture> materialCache = new HashMap<>();
     private final boolean[] slotHasN = new boolean[MAX_TEXTURES];
     private final boolean[] slotHasS = new boolean[MAX_TEXTURES];
@@ -102,8 +102,8 @@ public final class RtEntityTextures {
             return 0;
         }
         int slot = slotForView(resolveView(renderType));
-        // P6.2c: resolve this per-type texture's LabPBR _n/_s siblings into the parallel bindless arrays
-        // the first time the slot is seen (slots can recur every frame via the same shared handle). Marked
+        // Resolve this per-type texture's LabPBR _n/_s siblings into the parallel bindless arrays the
+        // first time the slot is seen (slots can recur every frame via the same shared handle). Marked
         // resolved up front so a one-off resolution miss isn't retried every frame.
         if (ENTITY_PBR && slot > 0 && !materialResolved[slot]) {
             materialResolved[slot] = true;

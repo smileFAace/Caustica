@@ -1,8 +1,9 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.pipeline;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.vulkan.VulkanDevice;
 import dev.upscaler.UpscalerMod;
+import dev.upscaler.rt.accel.RtImage;
 import dev.upscaler.mixin.GpuDeviceAccessor;
 import dev.upscaler.ngx.NgxLibrary;
 import net.fabricmc.loader.api.FabricLoader;
@@ -20,11 +21,8 @@ import java.nio.file.Path;
 
 /**
  * DLSS Ray Reconstruction backend for the RT renderer. Runs the DLSSD (Ray Reconstruction) feature
- * over our path-traced color + guide buffers (normals/roughness, diffuse/specular albedo, depth,
- * motion vectors, reflection motion vectors), denoising and upscaling (render res -> display res) in one pass.
- *
- * <p>P4.2a wired NGX init, the RR-available gate, and feature creation. P4.2b adds the render-res
- * split (trace render res &lt; display res, RR upscales to display) and sub-pixel camera jitter.
+ * over path-traced color + guide buffers (normals/roughness, diffuse/specular albedo, depth, motion
+ * vectors, reflection motion vectors), denoising and upscaling (render res → display res) in one pass.
  */
 public final class RtDlssRr {
     public static final RtDlssRr INSTANCE = new RtDlssRr();
@@ -43,7 +41,7 @@ public final class RtDlssRr {
     private static final int FEATURE_FLAG_MV_LOW_RES = 1 << 1;
     private static final int FEATURE_FLAG_AUTO_EXPOSURE = 1 << 6;
     private static final int FEATURE_FLAGS = FEATURE_FLAG_IS_HDR | FEATURE_FLAG_MV_LOW_RES | FEATURE_FLAG_AUTO_EXPOSURE;
-    // 0 = let the RR DLL pick its per-mode default preset (tuned in P4.3).
+    // 0 = let the RR DLL pick its per-mode default preset.
     private static final int RENDER_PRESET = Integer.getInteger("upscaler.rt.dlssRr.preset", 0);
 
     private final int quality = Integer.getInteger("upscaler.rt.dlssRr.quality", QUALITY_MAX_PERF);
@@ -107,7 +105,7 @@ public final class RtDlssRr {
                         specularHitDistance.view, specularHitDistance.image, VK10.VK_FORMAT_R32_SFLOAT,
                         out.view, out.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
                         renderWidth, renderHeight, displayWidth, displayHeight,
-                        // jitter in render pixels (P4.2b); MVs are already in render-pixel units, so MV scale = 1.
+                        // jitter in render pixels; MVs are already in render-pixel units, so MV scale = 1.
                         jitterX, jitterY, 1.0f, 1.0f, resetHistory ? 1 : 0, frameMs,
                         worldToViewMatrix, viewToClipMatrix);
             }
@@ -127,7 +125,7 @@ public final class RtDlssRr {
     /**
      * Ensure NGX is initialized and an RR feature exists for the given resolutions, creating it into
      * the supplied recording command buffer. Returns false (and disables itself) on any failure so the
-     * caller falls back to the non-RR path. P4.2a uses render == display (native-res denoise).
+     * caller falls back to the non-RR path.
      */
     public boolean ensureFeature(long cmd, int renderWidth, int renderHeight, int displayWidth, int displayHeight) {
         if (!ENABLED || failed) {

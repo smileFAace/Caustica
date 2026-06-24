@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.accel;
 
 import org.lwjgl.util.vma.Vma;
 import org.lwjgl.vulkan.VK10;
@@ -6,7 +6,7 @@ import org.lwjgl.vulkan.VkDevice;
 
 /**
  * A VMA-backed image + view, created in {@code VK_IMAGE_LAYOUT_GENERAL}. Used for RT output
- * storage images. Created via {@link RtContext#createStorageImage}; freed with {@link #destroy()}.
+ * storage images. Created via {@link dev.upscaler.rt.RtContext#createStorageImage}; freed with {@link #destroy()}.
  */
 public final class RtImage {
     public final long image;
@@ -19,7 +19,7 @@ public final class RtImage {
     private final VkDevice vk;
     private boolean destroyed;
 
-    RtImage(long vma, VkDevice vk, long image, long allocation, long view, int width, int height) {
+    public RtImage(long vma, VkDevice vk, long image, long allocation, long view, int width, int height) {
         this.vma = vma;
         this.vk = vk;
         this.image = image;

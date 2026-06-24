@@ -1,7 +1,11 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.pipeline;
 
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
 import dev.upscaler.UpscalerMod;
+import dev.upscaler.rt.RtContext;
+import dev.upscaler.rt.RtDebugLabels;
+import dev.upscaler.rt.accel.RtBuffer;
+import dev.upscaler.rt.accel.RtImage;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
 import org.lwjgl.vulkan.VK10;
@@ -10,7 +14,7 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkImageSubresourceRange;
 
 /** Owns the display exposure value shared by the RT compositor's display-mapping passes. */
-final class RtExposure {
+public final class RtExposure {
     private static final float DEFAULT_FIXED_EXPOSURE = 1.1f;
 
     private final Mode mode = Mode.parse(System.getProperty("upscaler.rt.exposure.mode", "auto"));
@@ -31,15 +35,15 @@ final class RtExposure {
     private boolean logged;
     private long lastFrameNanos;
 
-    RtImage image() {
+    public RtImage image() {
         return image;
     }
 
-    boolean ready() {
+    public boolean ready() {
         return image != null;
     }
 
-    void ensureResources(RtContext ctx) {
+    public void ensureResources(RtContext ctx) {
         if (image == null) {
             image = ctx.createStorageImage(1, 1, VK10.VK_FORMAT_R32_SFLOAT, "display exposure");
         }
@@ -60,7 +64,7 @@ final class RtExposure {
         logOnce();
     }
 
-    void record(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
+    public void record(RtContext ctx, VkCommandBuffer cmd, MemoryStack stack, RtImage traceColor) {
         if (image == null) {
             throw new IllegalStateException("RT exposure image not created");
         }
@@ -78,7 +82,7 @@ final class RtExposure {
         }
     }
 
-    void destroy() {
+    public void destroy() {
         if (pipeline != null) {
             pipeline.destroy();
             pipeline = null;

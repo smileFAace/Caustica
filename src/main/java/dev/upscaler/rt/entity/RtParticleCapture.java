@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.entity;
 
 import com.mojang.blaze3d.vertex.VertexConsumer;
 

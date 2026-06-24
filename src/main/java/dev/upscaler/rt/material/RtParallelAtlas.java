@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.material;
 
 import com.mojang.blaze3d.platform.NativeImage;
 import com.mojang.blaze3d.textures.GpuTextureView;

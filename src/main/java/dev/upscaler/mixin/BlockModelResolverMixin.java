@@ -1,6 +1,6 @@
 package dev.upscaler.mixin;
 
-import dev.upscaler.rt.ContainedBlockSource;
+import dev.upscaler.rt.entity.ContainedBlockSource;
 import net.minecraft.client.renderer.block.BlockModelResolver;
 import net.minecraft.client.renderer.block.BlockModelRenderState;
 import net.minecraft.client.renderer.block.model.BlockDisplayContext;

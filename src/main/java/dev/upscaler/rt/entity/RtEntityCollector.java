@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.entity;
 
 import com.mojang.blaze3d.pipeline.ColorTargetState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
@@ -38,17 +38,19 @@ import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.joml.Quaternionf;
 
+import dev.upscaler.rt.material.RtBlockMaterials;
+import dev.upscaler.rt.material.RtEntityMaterials;
+import dev.upscaler.rt.material.RtParallelAtlas;
+
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * P5.1b-2 capture infrastructure: a {@link SubmitNodeCollector} that intercepts entity model
- * submissions and renders them straight into an {@link RtEntityCapture}, reusing all of vanilla's
- * posing/animation. {@code submitModel} is the hook (it is where {@code LivingEntityRenderer.submit}
- * sends the body + each feature layer); we pose the model from its render state and render it into the
- * capture. Every other submit* path (name tags, leashes, shadows, flames, held items, block models,
- * custom geometry, particles, gizmos) is a no-op — the entity *body geometry* is what we want for RT;
- * held items / custom geometry are not captured yet (acceptable, noted for P5.1b-2b).
+ * A {@link SubmitNodeCollector} that intercepts entity model submissions and renders them straight into
+ * an {@link RtEntityCapture}, reusing all of vanilla's posing/animation. {@code submitModel} is the
+ * hook (it is where {@code LivingEntityRenderer.submit} sends the body + each feature layer). Every
+ * other submit* path (name tags, leashes, shadows, flames, held items, block models, custom geometry,
+ * particles, gizmos) is a no-op — body geometry is what the RT path needs.
  *
  * <p>Driven once per entity per frame: {@link #begin} sets the capture, then {@code
  * EntityRenderDispatcher.submit} fans out into {@code submitModel} here. Reused across entities.
@@ -57,7 +59,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private static final Direction[] DIRECTIONS = Direction.values();
 
     private RtEntityCapture capture;
-    private ModelBlockRenderer blockRenderer; // P5.1b-2e: lazily-built mesher for moving (falling) blocks
+    private ModelBlockRenderer blockRenderer; // lazily-built mesher for moving (falling) blocks
 
     /** Point the collector at the capture buffer for the next {@code dispatcher.submit}. */
     public void begin(RtEntityCapture capture) {
@@ -90,7 +92,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 capture.currentHasN = (flags & RtParallelAtlas.HAS_N) != 0;
             }
         } else {
-            // Mobs use a per-type texture — pick up its LabPBR _n/_s presence for the prim flags (P6.2c).
+            // Mobs use a per-type texture — pick up its LabPBR _n/_s presence for the prim flags.
             int slot = RtEntityTextures.INSTANCE.slotFor(renderType);
             capture.currentTexSlot = slot;
             capture.currentHasS = RtEntityTextures.INSTANCE.slotHasSpec(slot);
@@ -237,9 +239,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     public void submitLeash(PoseStack poseStack, EntityRenderState.LeashState leashState) {
     }
 
-    // P5.1b-2e: falling blocks render here. Mesh the block model (vanilla's mesher, same as terrain)
-    // into the capture; the -0.5,0,-0.5 centring is already baked into poseStack by FallingBlockRenderer,
-    // so the [0,1] block-model quads transform straight by poseStack.last().pose(). Block-atlas textured.
+    // Falling blocks render here. Mesh the block model (vanilla's mesher, same as terrain) into the
+    // capture; the -0.5,0,-0.5 centring is already baked into poseStack by FallingBlockRenderer, so the
+    // [0,1] block-model quads transform straight by poseStack.last().pose(). Block-atlas textured.
     @Override
     public void submitMovingBlock(PoseStack poseStack, MovingBlockRenderState state, int outlineColor) {
         if (capture == null) {
@@ -271,8 +273,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         blockRenderer.tesselateBlock(out, 0, 0, 0, state, state.blockPos, bs, model, bs.getSeed(state.blockPos));
     }
 
-    // P5.1b-2e: falling blocks (FallingBlockEntity) render their block model here. Capture every part's
-    // quads (direction-independent + all six cullface lists), block-atlas textured (slot 0).
+    // FallingBlockEntity renders its block model here. Capture every part's quads (direction-independent
+    // + all six cullface lists), block-atlas textured (slot 0).
     @Override
     public void submitBlockModel(PoseStack poseStack, RenderType renderType, List<BlockStateModelPart> parts,
                                  int[] tintLayers, int lightCoords, int overlayCoords, int outlineColor) {
@@ -297,8 +299,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                                    float width, boolean afterTerrain) {
     }
 
-    // P5.1b-2d: held weapons/tools (via the in-hand layer) + dropped items (ItemEntity) render here as
-    // baked quads on the block atlas. Capture them block-atlas textured (slot 0).
+    // Held weapons/tools (via the in-hand layer) + dropped items (ItemEntity) render here as baked
+    // quads on the block atlas. Capture them block-atlas textured (slot 0).
     @Override
     public void submitItem(PoseStack poseStack, ItemDisplayContext displayContext, int lightCoords, int overlayCoords,
                            int outlineColor, int[] tintLayers, List<BakedQuad> quads, ItemStackRenderState.FoilType foilType) {

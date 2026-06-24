@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.entity;
 
 import com.mojang.blaze3d.vertex.PoseStack;
 import dev.upscaler.mixin.ParticleEngineAccessor;
@@ -18,8 +18,6 @@ import net.minecraft.client.renderer.entity.state.EntityRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 
-import java.util.IdentityHashMap;
-import java.util.Queue;
 import net.minecraft.core.BlockPos;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
@@ -29,24 +27,32 @@ import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
 import org.lwjgl.system.MemoryUtil;
 
+import dev.upscaler.rt.RtComposite;
+import dev.upscaler.rt.RtContext;
+import dev.upscaler.rt.accel.RtAccel;
+import dev.upscaler.rt.accel.RtBuffer;
+import dev.upscaler.rt.accel.RtBufferPool;
+import dev.upscaler.rt.pipeline.RtPipeline;
+
+import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 
 /**
- * P5.1b-2: dynamic entities as real ray-traced {@code ModelPart} geometry. Each frame, every model
- * entity is re-posed and captured ({@link RtEntityCollector} + {@link RtEntityCapture}) into a mesh in
- * terrain's vertex layout, uploaded, and given a per-entity BLAS built inline in the composite's frame
- * command buffer; one TLAS instance per entity (identity transform — geometry is captured directly in
- * terrain's rebased space) carries the {@link #ENTITY_BIT} custom-index flag so {@code world.rchit}
- * takes the entity path. A per-frame entity geometry table ({@code {primAddr, idxAddr, uvAddr, disp}})
- * gives the hit shader each entity's per-triangle normals/tint and its per-object motion-vector
- * displacement (P5.1c). Non-model entities (items/arrows — geometry via submitItem/submitBlockModel,
- * which the collector ignores) are skipped.
- *
- * <p>Shading is flat vertex-colour (white → grey-lit) until entity textures land (P5.1b-2b): entities
- * use per-type texture files, not the block atlas, so the captured UVs are stored but not yet sampled.
+ * Dynamic entities as real ray-traced {@code ModelPart} geometry. Each frame, every model entity is
+ * re-posed and captured ({@link RtEntityCollector} + {@link RtEntityCapture}) into a mesh in terrain's
+ * vertex layout, uploaded, and given a per-entity BLAS built inline in the composite's frame command
+ * buffer. One TLAS instance per entity (identity transform — geometry is captured directly in terrain's
+ * rebased space) carries the {@link #ENTITY_BIT} custom-index flag so {@code world.rchit} takes the
+ * entity path. A per-frame entity geometry table ({@code {primAddr, idxAddr, uvAddr, disp}}) gives the
+ * hit shader each entity's per-triangle normals/tint and its per-object motion-vector displacement.
+ * Non-model entities (items/arrows — geometry via submitItem/submitBlockModel, which the collector
+ * ignores) are skipped.
  *
  * <p>Per-frame cost is real (per-entity capture + buffer uploads + a BLAS build); capped by {@code
  * -Dupscaler.rt.maxEntities}. A reusable mesh/BLAS pool is a deferred perf item.
@@ -65,25 +71,23 @@ public final class RtEntities {
     private static final int MAX_ENTITIES = Integer.getInteger("upscaler.rt.maxEntities", 1024);
     // Chunk radius around the player to scan for block entities (chests/signs/…) each frame.
     private static final int BE_VIEW_CHUNKS = Integer.getInteger("upscaler.rt.beViewChunks", 8);
-    // P5-perf #2: block entities keep a cached mesh + BLAS keyed by BlockPos. Each frame the BE is re-meshed
-    // (cheap) and its mesh hashed; the expensive BLAS is rebuilt ONLY when the mesh actually changed — so
-    // static BEs cost no GPU work (the new-chunk stutter was rebuilding all of them every frame) while
-    // animating ones (chest lid, spawner, …) rebuild every frame and stay smooth. New/changed rebuilds are
-    // capped per frame so a burst of newly loaded chunks can't stall (over-budget BEs keep their last
-    // geometry / pop in over later frames, like terrain's SECTIONS_PER_TICK).
+    // Block entities keep a cached mesh + BLAS keyed by BlockPos. Each frame the BE is re-meshed (cheap)
+    // and its mesh hashed; the expensive BLAS is rebuilt ONLY when the mesh actually changed — so static
+    // BEs cost no GPU work while animating ones (chest lid, spawner, …) rebuild every frame. New/changed
+    // rebuilds are capped per frame so a burst of newly loaded chunks can't stall (over-budget BEs keep
+    // their last geometry / pop in over later frames, like terrain's SECTIONS_PER_TICK).
     private static final int BE_BUILDS_PER_FRAME = Integer.getInteger("upscaler.rt.beBuildsPerFrame", 8);
     // Entity geometry table entry: {u64 primAddr, u64 idxAddr, u64 uvAddr, u64 dispAddr, vec4 rigidDisp}
-    // = 48 bytes (std430 vec4 forces 16-align/48-size). P5.1c-2: dispAddr points at a per-vertex
-    // world-space displacement buffer; when it is 0, rigidDisp.xyz carries whole-object motion (or zero).
+    // = 48 bytes (std430 vec4 forces 16-align/48-size). dispAddr points at a per-vertex world-space
+    // displacement buffer; when it is 0, rigidDisp.xyz carries whole-object motion (or zero).
     private static final int TABLE_ENTRY_BYTES = 48;
     // Ring of fixed-size geometry tables: each frame fills the next slot so the GPU read of this frame's
     // trace never races a later frame's host write. > frames-in-flight (mirrors RtPipeline RING).
     private static final int TABLE_RING = 6;
     // Frames a per-frame entity resource (mesh buffers + BLAS + scratch) must outlive before it's freed.
     private static final int KEEP_FRAMES = 4;
-    // P5-perf #1 (step 2): refit (UPDATE-mode) BLAS. Persistent per-entity AS, refit in place each frame
-    // (cheap) while topology is stable, instead of a full BUILD. Toggle for A/B + fallback to step-1
-    // pooled BUILD. Block entities always use the pooled-BUILD path (they get P5-perf #2 instead).
+    // Refit (UPDATE-mode) BLAS: persistent per-entity AS, refit in place each frame (cheap) while
+    // topology is stable, instead of a full BUILD. Block entities always use the pooled-BUILD path.
     private static final boolean REFIT = Boolean.parseBoolean(System.getProperty("upscaler.rt.entityRefit", "true"));
     // Per-entity ring depth: a slot is reused every REFIT_RING frames, so it must be off all queues by
     // then. = KEEP_FRAMES (the established frames-in-flight-safe horizon). Each slot holds one persistent AS.
@@ -110,7 +114,7 @@ public final class RtEntities {
     // identity in `particlePrev` (rebuilt each frame → prunes dead particles).
     private final RtParticleCapture particleCapture = new RtParticleCapture(capture);
     private final QuadParticleRenderState particleScratch = new QuadParticleRenderState();
-    private final it.unimi.dsi.fastutil.floats.FloatArrayList particleDisp = new it.unimi.dsi.fastutil.floats.FloatArrayList();
+    private final FloatArrayList particleDisp = new FloatArrayList();
     private IdentityHashMap<Particle, ParticlePrev> particlePrev = new IdentityHashMap<>();
 
     /** Previous frame's particle center (rebase-space) + that frame's rebase origin, for the MV diff. */
@@ -120,13 +124,13 @@ public final class RtEntities {
     private RtBuffer[] tableRing;
     private int tableSlot;
 
-    // P5-perf #1 (step 1): recycle per-frame entity mesh buffers + BLAS backing/scratch instead of
-    // alloc/free churning ~6 VMA buffers per entity per frame. See RtBufferPool.
+    // Recycle per-frame entity mesh buffers + BLAS backing/scratch instead of alloc/free churning
+    // ~6 VMA buffers per entity per frame. See RtBufferPool.
     private final RtBufferPool pool = new RtBufferPool();
 
-    // P5.1c-2: previous frame's captured (rebase-space) vertex positions + that frame's rebase origin,
-    // keyed by entity id. The maps are swapped/reused each frame: entries not seen this frame fall out,
-    // while visible entities keep their float[] backing to avoid steady-state allocation churn.
+    // Previous frame's captured (rebase-space) vertex positions + that frame's rebase origin, keyed by
+    // entity id. Maps are swapped/reused each frame: entries not seen this frame fall out, while visible
+    // entities keep their float[] backing to avoid steady-state allocation churn.
     private Map<Integer, EntityPrev> prevVerts = new HashMap<>();
     private Map<Integer, EntityPrev> curVerts = new HashMap<>();
 
@@ -141,11 +145,10 @@ public final class RtEntities {
     // Per-frame entity GPU resources awaiting a frames-in-flight-safe free.
     private final List<Deferred> deferred = new ArrayList<>();
 
-    // P5-perf #1 (step 2): persistent per-entity acceleration structures, keyed by entity id, for refit.
+    // Persistent per-entity acceleration structures, keyed by entity id, for refit.
     private final Map<Integer, EntityAccel> entityAccels = new HashMap<>();
 
-    // P5-perf #2: persistent per-block-entity geometry, keyed by BlockPos.asLong(). Built once and reused
-    // every frame (the chunk-load stutter was rebuilding all of these every frame).
+    // Persistent per-block-entity geometry, keyed by BlockPos.asLong(). Built once and reused every frame.
     private final Map<Long, BeEntry> beCache = new HashMap<>();
     // (Re)builds recorded so far this frame, reset each beginFrame; gates new BE builds to BE_BUILDS_PER_FRAME.
     private int beBuildsThisFrame;
@@ -167,7 +170,7 @@ public final class RtEntities {
         int bx, by, bz;                          // block position (drives the per-frame instance transform)
         long meshHash;                           // hash of the captured mesh — rebuild only when it changes
         long lastSeen;                           // last frame this BE was in the scan window — for eviction
-        float[] prevVerts;                       // P5.1c-2: block-local verts at this build, for the per-vertex MV diff
+        float[] prevVerts;                       // block-local verts at this build, for the per-vertex MV diff
     }
 
     /** One persistent updatable AS in an entity's ring: its backing buffer (pool-owned) + the topology it
@@ -314,8 +317,8 @@ public final class RtEntities {
                 continue; // non-model entity (arrow/etc.) — no body geometry captured
             }
             int id = entity.getId();
-            // P5.1c-2: motion vs last frame's posed mesh. New/topology-changed entities get one frame of
-            // camera-only MV; rigid translation is packed into the table, deformation gets a disp buffer.
+            // Motion vs last frame's posed mesh. New/topology-changed entities get one frame of camera-only
+            // MV; rigid translation is packed into the table, deformation gets a disp buffer.
             EntityPrev prev = prevVerts.get(id);
             Motion motion = uploadVertexMotion(ctx, build, capture.verts, prev, rbx, rby, rbz, "entity " + id);
             curVerts.put(id, storeEntityPrev(prev, capture.verts, rbx, rby, rbz));
@@ -332,7 +335,7 @@ public final class RtEntities {
      * store it as a rigid vector in the geometry-table entry; otherwise write a per-vertex {@code vec4}
      * buffer directly, avoiding the old intermediate {@code float[]}.
      */
-    private Motion uploadVertexMotion(RtContext ctx, FrameBuild build, it.unimi.dsi.fastutil.floats.FloatArrayList cur,
+    private Motion uploadVertexMotion(RtContext ctx, FrameBuild build, FloatArrayList cur,
                                       EntityPrev prev, int rbx, int rby, int rbz, String label) {
         if (prev == null || prev.size != cur.size()) {
             return NO_MOTION;
@@ -380,7 +383,7 @@ public final class RtEntities {
         return new Motion(dispBuf.deviceAddress, 0f, 0f, 0f);
     }
 
-    private static EntityPrev storeEntityPrev(EntityPrev prev, it.unimi.dsi.fastutil.floats.FloatArrayList cur,
+    private static EntityPrev storeEntityPrev(EntityPrev prev, FloatArrayList cur,
                                               int rbx, int rby, int rbz) {
         EntityPrev out = prev != null ? prev : new EntityPrev();
         int size = cur.size();
@@ -523,13 +526,13 @@ public final class RtEntities {
     }
 
     /**
-     * Capture block entities (chests, signs, …). P5-perf #2: each BE keeps a cached mesh + BLAS keyed by
-     * BlockPos. Every frame the BE is re-meshed (cheap) and its mesh hashed; the expensive BLAS is rebuilt
-     * only when the mesh actually changed — so static BEs cost no GPU work (the new-chunk stutter was
-     * rebuilding all of them every frame) while animating ones (chest lid, spawner, …) rebuild every frame
-     * and stay smooth. New/changed rebuilds are capped at {@link #BE_BUILDS_PER_FRAME} per frame so a burst
-     * of newly loaded chunks can't stall; over-budget BEs keep their last geometry / pop in over later
-     * frames. Captured block-local → placed by a translate-only instance transform; static, so the MV is 0.
+     * Capture block entities (chests, signs, …). Each BE keeps a cached mesh + BLAS keyed by BlockPos.
+     * Every frame the BE is re-meshed (cheap) and its mesh hashed; the expensive BLAS is rebuilt only when
+     * the mesh actually changed — so static BEs cost no GPU work while animating ones (chest lid, spawner,
+     * …) rebuild every frame and stay smooth. New/changed rebuilds are capped at {@link
+     * #BE_BUILDS_PER_FRAME} per frame so a burst of newly loaded chunks can't stall; over-budget BEs keep
+     * their last geometry / pop in over later frames. Captured block-local → placed by a translate-only
+     * instance transform; static, so the MV is 0.
      */
     private void captureBlockEntities(RtContext ctx, FrameBuild build, Minecraft mc, ClientLevel level, float partial, int rbx, int rby, int rbz) {
         beBuildsThisFrame = 0;
@@ -601,8 +604,8 @@ public final class RtEntities {
                 }
                 return;
             }
-            // P5.1c-2: per-vertex MV from the previous build's block-local mesh (same vertex count ⇒
-            // pairable). The BE itself doesn't move, so the world displacement is the pure local delta.
+            // Per-vertex MV from the previous build's block-local mesh (same vertex count ⇒ pairable).
+            // The BE itself doesn't move, so the world displacement is the pure local delta.
             if (entry != null && entry.prevVerts != null && entry.prevVerts.length == capture.verts.size()) {
                 disp = buildDisp(capture.verts.elements(), capture.verts.size(), entry.prevVerts, 0f, 0f, 0f);
             }
@@ -660,7 +663,7 @@ public final class RtEntities {
         e.by = p.getY();
         e.bz = p.getZ();
         e.meshHash = hash;
-        // P5.1c-2: retain this build's block-local verts so the next rebuild can diff against them for the MV.
+        // Retain this build's block-local verts so the next rebuild can diff against them for the MV.
         e.prevVerts = java.util.Arrays.copyOf(capture.verts.elements(), capture.verts.size());
         return e;
     }
@@ -692,9 +695,9 @@ public final class RtEntities {
             return;
         }
         beginBuildIfNeeded(ctx, build);
-        // P5.1c-2: disp is non-null only for a BE whose mesh changed this frame (chest lid / spawner); a
-        // static BE passes null ⇒ dispAddr 0 ⇒ no MV. The disp buffer is a per-frame transient (the geom
-        // table is rewritten every frame), so a BE that stops animating reverts to MV 0 next frame.
+        // disp is non-null only for a BE whose mesh changed this frame (chest lid / spawner); a static BE
+        // passes null ⇒ dispAddr 0 ⇒ no MV. The disp buffer is a per-frame transient, so a BE that stops
+        // animating reverts to MV 0 next frame.
         long dispAddr = uploadDisp(ctx, build, disp, "block entity");
         writeTableEntry(build, e.prim.deviceAddress, e.indices.deviceAddress, e.uvs.deviceAddress, dispAddr, 0f, 0f, 0f);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
@@ -721,7 +724,7 @@ public final class RtEntities {
             return;
         }
         long now = RtComposite.frameCounter();
-        java.util.Iterator<Map.Entry<Long, BeEntry>> it = beCache.entrySet().iterator();
+        Iterator<Map.Entry<Long, BeEntry>> it = beCache.entrySet().iterator();
         while (it.hasNext()) {
             BeEntry e = it.next().getValue();
             if (now - e.lastSeen < KEEP_FRAMES) {
@@ -751,7 +754,7 @@ public final class RtEntities {
     /**
      * Upload the current {@link #capture} as a per-object mesh + BLAS, add its instance + geom-table entry.
      * {@code entityId} ≥ 0 → refit path (persistent updatable AS keyed by id); {@code < 0} (refit disabled)
-     * → pooled full BUILD (step 1). Used by the animated-entity pass; block entities use {@link #buildBe}.
+     * → pooled full BUILD. Used by the animated-entity pass; block entities use {@link #buildBe}.
      */
     private void appendCapture(RtContext ctx, FrameBuild build, float[] disp, int entityId, int instanceBit, int mask) {
         beginBuildIfNeeded(ctx, build);
@@ -888,7 +891,7 @@ public final class RtEntities {
             return;
         }
         long now = RtComposite.frameCounter();
-        java.util.Iterator<Map.Entry<Integer, EntityAccel>> it = entityAccels.entrySet().iterator();
+        Iterator<Map.Entry<Integer, EntityAccel>> it = entityAccels.entrySet().iterator();
         while (it.hasNext()) {
             EntityAccel ea = it.next().getValue();
             if (now - ea.lastSeen < KEEP_FRAMES) {
@@ -933,7 +936,7 @@ public final class RtEntities {
             return;
         }
         long now = RtComposite.frameCounter();
-        java.util.Iterator<Deferred> it = deferred.iterator();
+        Iterator<Deferred> it = deferred.iterator();
         while (it.hasNext()) {
             Deferred d = it.next();
             if (d.freeFrame() <= now) {

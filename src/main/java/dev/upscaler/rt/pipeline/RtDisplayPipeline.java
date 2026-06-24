@@ -1,4 +1,4 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.pipeline;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.system.MemoryUtil;
@@ -21,6 +21,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+
+import dev.upscaler.rt.RtContext;
+import dev.upscaler.rt.RtDebugLabels;
 
 import static dev.upscaler.rt.RtContext.check;
 

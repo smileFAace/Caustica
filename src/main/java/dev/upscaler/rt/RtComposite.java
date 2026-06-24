@@ -31,8 +31,25 @@ import org.lwjgl.vulkan.VkImageBlit;
 import org.lwjgl.vulkan.VkImageCopy;
 import org.lwjgl.vulkan.VkSamplerCreateInfo;
 
+import dev.upscaler.rt.accel.RtAccel;
+import dev.upscaler.rt.accel.RtBuffer;
+import dev.upscaler.rt.accel.RtImage;
+import dev.upscaler.rt.entity.RtEntities;
+import dev.upscaler.rt.entity.RtEntityTextures;
+import dev.upscaler.rt.material.RtBlockMaterials;
+import dev.upscaler.rt.material.RtEntityMaterials;
+import dev.upscaler.rt.material.RtMaterials;
+import dev.upscaler.rt.pipeline.RtDisplayPipeline;
+import dev.upscaler.rt.pipeline.RtDlssRr;
+import dev.upscaler.rt.pipeline.RtExposure;
+import dev.upscaler.rt.pipeline.RtPipeline;
+import dev.upscaler.rt.terrain.RtTerrain;
+
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
 
 /**
  * On-screen composite. Each frame, ray-trace into a render-res storage image (+ guide buffers), use
@@ -40,10 +57,10 @@ import java.nio.LongBuffer;
  * copy of the world color, and copy the result back to the world target at the
  * end-of-world seam. Gated by {@code -Dupscaler.rt.composite=true}.
  *
- * <p>P4.2b resolution split: the path tracer and its guide buffers run at {@link #RENDER_SCALE} of
- * display res with a per-frame sub-pixel camera jitter; DLSS-RR ({@link RtDlssRr}) reconstructs the
- * display-res image. With RR disabled the trace runs at 1:1 and a linear blit stands in for the
- * upscale (a raw, noisy reference). Output selection is controlled by {@code -Dupscaler.rt.output=rt|vanilla}.
+ * <p>The path tracer and its guide buffers run at {@link #RENDER_SCALE} of display res with a per-frame
+ * sub-pixel camera jitter; DLSS-RR ({@link RtDlssRr}) reconstructs the display-res image. With RR
+ * disabled the trace runs at 1:1 and a linear blit stands in for the upscale (a raw, noisy reference).
+ * Output selection: {@code -Dupscaler.rt.output=rt|vanilla}.
  *
  * <p>Traces the extracted {@link RtTerrain} with perspective camera rays (camera matrices captured
  * each frame via {@link #captureFrame}); writes nothing until terrain is available.
@@ -55,11 +72,11 @@ public final class RtComposite {
 
     // invViewProj(64) + camOffset(@64) + sectionTableAddr(@80) + debugView(@88) + frameIndex(@92)
     // + prevViewProj(@96) + camDelta(@160) + spp(@172) + jitter(@176) + entityTableAddr(@184)
-    // + flags(@192): P6.1 bit 0 = camera submerged, bit 1 = PBR BRDF enabled
-    // + P6.3 dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
+    // + flags(@192): bit 0 = camera submerged, bit 1 = PBR BRDF enabled
+    // + dynamic sky (16-byte aligned vec4s): sunDir+dayFactor(@208) + lightDir(@224) + lightRadiance(@240)
     // + sky rewrite: moonDir+moonPhase(@256) + celestialAxis+starAngle(@272) + sunUv(@288) + moonUv(@304)
     private static final int WORLD_PUSH_SIZE = 320;
-    private static final int GUIDE_COUNT = 7; // P4/RR guide buffers bound at world-pipeline bindings 3..9
+    private static final int GUIDE_COUNT = 7; // RR guide buffers bound at world-pipeline bindings 3..9
     // Frames a retired per-frame TLAS must outlive before it's freed (> frames-in-flight); matches
     // RtTerrain's deferred-free horizon. The frame TLAS is built + traced this frame, then freed once
     // the composite frame counter has advanced this far past it (so no in-flight frame still reads it).
@@ -70,13 +87,13 @@ public final class RtComposite {
     /** Samples per pixel per frame. Default 1: DLSS-RR denoises ~1 spp; raise for the no-RR reference. */
     public static final int SPP = Math.max(1, Integer.getInteger("upscaler.rt.spp", 1));
     /**
-     * P6.3 dynamic sky: drive the sun/moon direction, light colour and sky gradient from the game's time
-     * of day. {@code -Dupscaler.rt.dynamicSky=false} pins the legacy fixed noon sun for a clean A/B.
+     * Drive the sun/moon direction, light colour and sky gradient from the game's time of day.
+     * {@code -Dupscaler.rt.dynamicSky=false} pins a fixed noon sun.
      */
     public static final boolean DYNAMIC_SKY = Boolean.parseBoolean(System.getProperty("upscaler.rt.dynamicSky", "true"));
     /**
-     * P6.3b soft shadows: give the sun/moon a finite angular size so NEE shadow rays sample the light's
-     * disk (soft, contact-hardening penumbrae). {@code -Dupscaler.rt.softShadows=false} -> hard shadows.
+     * Give the sun/moon a finite angular size so NEE shadow rays sample the light's disk (soft,
+     * contact-hardening penumbrae). {@code -Dupscaler.rt.softShadows=false} → hard shadows.
      * Radii in degrees; the real sun/moon are ~0.27° but a touch larger reads as a pleasant penumbra.
      */
     public static final boolean SOFT_SHADOWS = Boolean.parseBoolean(System.getProperty("upscaler.rt.softShadows", "true"));
@@ -91,13 +108,13 @@ public final class RtComposite {
     private static final float CELESTIAL_AXIS_Y = -SUN_NOON_Z;
     private static final float CELESTIAL_AXIS_Z = SUN_NOON_Y;
     /**
-     * P4.2b RT trace scale: the path tracer + guide buffers run at this fraction of display resolution
-     * and DLSS-RR upscales to display. Only applied when {@link RtDlssRr#ENABLED}; the no-RR reference
-     * traces at 1.0 (a 1:1 blit). Default 1/1.5 matches DLSS MaxQuality. {@code -Dupscaler.rt.renderScale}.
+     * RT trace scale: the path tracer + guide buffers run at this fraction of display resolution and
+     * DLSS-RR upscales to display. Only applied when {@link RtDlssRr#ENABLED}; the no-RR reference traces
+     * at 1.0 (a 1:1 blit). Default 1/1.5 matches DLSS MaxQuality. {@code -Dupscaler.rt.renderScale}.
      */
     public static final float RENDER_SCALE = parseRenderScale();
     // Sign of the sub-pixel jitter as reported to DLSS-RR + applied to the primary ray, mirroring the
-    // validated DLSS-SR convention (Vulkan flipped clip space wants Y negated). Tune in P4.3.
+    // validated DLSS-SR convention (Vulkan flipped clip space wants Y negated).
     private static final float JITTER_SIGN_X = Float.parseFloat(System.getProperty("upscaler.rt.jitterSignX", "1"));
     private static final float JITTER_SIGN_Y = Float.parseFloat(System.getProperty("upscaler.rt.jitterSignY", "-1"));
 
@@ -125,18 +142,17 @@ public final class RtComposite {
     private volatile boolean reloadRebindRequested;
     // The block-atlas view handle currently bound into the world pipeline (set by bindWorldTextures).
     private long boundAtlasHandle;
-    // P6.4: the world push data (256 B) is uploaded to a host-visible BDA ring instead of inline push
-    // constants, which were maxed at the 256-byte NVIDIA ceiling. Only the 8-byte slot address is pushed
-    // now (see WorldPushRef in the world shaders). One slot per in-flight frame, cycled per frame so an
-    // in-flight slot is never overwritten; created with the world pipeline and freed at shutdown.
+    // World push data (256 B) lives in a host-visible BDA ring; only the 8-byte slot address is pushed
+    // inline (256-byte NVIDIA push constant ceiling is otherwise exhausted by the world push struct).
+    // One slot per in-flight frame, cycled per frame so an in-flight slot is never overwritten.
     private static final int PUSH_RING = 6;
     private RtBuffer[] pushRing;
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
     private RtImage output;
     private RtImage displayImage;
-    // P4 guide buffers (first-hit attributes for the denoiser/DLSS-RR): normal+roughness, albedo,
-    // depth, motion, specular albedo, disabled specular hit distance, and reflection motion.
+    // Guide buffers (first-hit attributes for DLSS-RR): normal+roughness, albedo, depth, motion,
+    // specular albedo, disabled specular hit distance, and reflection motion.
     private RtImage gNormal;
     private RtImage gAlbedo;
     private RtImage gDepth;
@@ -149,14 +165,14 @@ public final class RtComposite {
     private RtImage rrOutput;
     private final RtExposure exposure = new RtExposure();
 
-    // P4.2b resolution split: the trace + guide buffers run at render res, the composite at display res.
+    // Trace + guide buffers run at render res; composite (display-mapping) runs at display res.
     private int displayW = -1;
     private int displayH = -1;
     private int renderW = -1;
     private int renderH = -1;
 
-    // Motion-vector reprojection state (P4.0b): the previous frame's camera-relative view-projection
-    // and camera position, read into the push constant each frame then advanced at frame end.
+    // Motion-vector reprojection state: the previous frame's camera-relative view-projection and
+    // camera position, read into the push constant each frame then advanced at frame end.
     private final Matrix4f mvPrevProjView = new Matrix4f();
     private final Matrix4f mvCurProjView = new Matrix4f();
     private final Matrix4f mvPushMatrix = new Matrix4f();
@@ -181,7 +197,7 @@ public final class RtComposite {
 
     // Per-frame TLASes awaiting a frames-in-flight-safe free (the build + trace that used them must
     // finish first). Each is retired at the composite frame counter it was built on + KEEP_FRAMES.
-    private final java.util.List<DeferredTlas> deferredTlas = new java.util.ArrayList<>();
+    private final List<DeferredTlas> deferredTlas = new ArrayList<>();
 
     /** A per-frame TLAS retired for a frames-in-flight-safe free once {@code freeFrame} is reached. */
     private record DeferredTlas(long freeFrame, RtAccel.PreparedTlas tlas) {
@@ -277,7 +293,7 @@ public final class RtComposite {
             worldPipeline = RtPipeline.create(ctx, "world.rgen.spv",
                     new String[]{"world.rmiss.spv", "shadow.rmiss.spv"}, "world.rchit.spv", "world.rahit.spv",
                     Long.BYTES, true, GUIDE_COUNT, RtEntityTextures.MAX_TEXTURES, RtMaterials.ENABLED, true);
-            // P6.4: per-frame push data now lives in this BDA ring; the pipeline only pushes its address.
+            // Per-frame push data lives in this BDA ring; the pipeline only pushes its address.
             if (pushRing == null) {
                 pushRing = new RtBuffer[PUSH_RING];
                 for (int i = 0; i < PUSH_RING; i++) {
@@ -292,8 +308,8 @@ public final class RtComposite {
             bindWorldTextures(ctx);
             reloadRebindRequested = false;
         }
-        // The TLAS is no longer bound here — it's rebuilt and bound per frame in recordFrame (P5.1a),
-        // since dynamic content (entities, P5.1b) animates the instance set every frame.
+        // The TLAS is rebuilt and bound per frame in recordFrame since dynamic entity content animates
+        // the instance set every frame.
         return worldPipeline;
     }
 
@@ -315,11 +331,10 @@ public final class RtComposite {
         // resolved samples something defined rather than an unbound (partially-bound) descriptor.
         RtEntityTextures.INSTANCE.reset();
         worldPipeline.setBindlessTexture(0, 0, atlasView, sampler); // binding 0 (albedo), slot 0 fallback
-        // P6.2a/b: LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels
-        // fill lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the
-        // block atlas view if an atlas didn't initialize, so bindings 8/9 always hold a valid descriptor —
-        // the shader only samples them when a prim is flagged (mat.z/mat.w), which can't happen unless the
-        // atlas exists, so the fallback content is never read.
+        // LabPBR _s + _n parallel atlases. Bind the (block-atlas-sized) atlases; their pixels fill
+        // lazily as terrain extraction encounters sprites and refresh via flush(). Fall back to the block
+        // atlas view if an atlas didn't initialize so bindings 8/9 always hold a valid descriptor —
+        // the shader only samples them when a prim is flagged (mat.z/mat.w), so the fallback is never read.
         if (RtMaterials.ENABLED) {
             RtBlockMaterials.INSTANCE.reset();
             // Build the full _s/_n atlases now (parallel decode + blit), before terrain tessellates, so
@@ -512,9 +527,8 @@ public final class RtComposite {
 
             boolean rrDone = false;
             RtTerrain terrain = RtTerrain.currentOrNull();
-            // P6.4: write this frame's push data into the next BDA ring slot (cycled so an in-flight slot
-            // is never overwritten). The std430 WorldPush layout matches these byte offsets exactly, so
-            // the put(offset, ...) writes below — and writeSky(push) — are unchanged from the inline-push era.
+            // Write this frame's push data into the next BDA ring slot (cycled so an in-flight slot is
+            // never overwritten). The std430 WorldPush layout matches these byte offsets exactly.
             pushSlot = (pushSlot + 1) % PUSH_RING;
             RtBuffer pushBuf = pushRing[pushSlot];
             ByteBuffer push = MemoryUtil.memByteBuffer(pushBuf.mapped, WORLD_PUSH_SIZE);
@@ -532,32 +546,28 @@ public final class RtComposite {
             push.putInt(172, SPP);
             push.putFloat(176, jitterX);
             push.putFloat(180, jitterY);
-            // P6.1 flags: PBR BRDF toggle + camera-in-water (so the path tracer starts in the water
-            // medium when the eye is submerged, fixing the air->water first-segment orientation).
+            // flags: PBR BRDF toggle + camera-in-water (so the path tracer starts in the water medium
+            // when the eye is submerged, fixing the air→water first-segment orientation).
             int flags = RtMaterials.ENABLED ? 0b10 : 0;
             var level = Minecraft.getInstance().level;
             if (level != null && level.getFluidState(BlockPos.containing(camX, camY, camZ)).is(FluidTags.WATER)) {
                 flags |= 0b01;
             }
             push.putInt(192, flags);
-            // P6.3: sun/moon direction + light radiance + sky day-factor, derived from the time of day.
             writeSky(push);
 
-            // P5.1a/b: rebuild the TLAS this frame from the static section instances merged with
-            // dynamic entity-box instances, bind it into the pipeline's descriptor ring, record the
-            // build into this frame's command buffer, then barrier so the trace sees the finished TLAS.
-            // The section BLAS are already built (async, by RtTerrain) and the entity cube BLAS is built
-            // once; only the cheap instance-level TLAS is rebuilt per frame. Retired KEEP_FRAMES later,
-            // once this frame is no longer in flight.
-            // P5.1b-2: capture this frame's entities as real meshes; their per-entity BLAS are built
-            // inline below and merged into the per-frame TLAS. geomTableAddr feeds the chit entity path
-            // (per-prim normal/tint) and per-object motion vectors (0 when no model entities present).
+            // Rebuild the TLAS this frame from static section instances merged with dynamic entity
+            // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
+            // the trace sees the finished TLAS. Section BLASes are already built (async, by RtTerrain);
+            // only the cheap instance-level TLAS is rebuilt per frame. Retired KEEP_FRAMES later.
+            // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
+            // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
                     terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
             push.putLong(184, fe.geomTableAddr());
             // Upload any entity textures registered this frame into the bindless set before the trace.
             RtEntityTextures.INSTANCE.uploadPending(active, atlasSampler(ctx));
-            // P6.2a: re-upload the LabPBR _s atlas if extraction added sprites since the last frame (the
+            // Re-upload the LabPBR _s atlas if extraction added sprites since the last frame (the
             // view handle is stable, so no re-bind needed). Before the trace records, like uploadPending.
             if (RtMaterials.ENABLED) {
                 RtBlockMaterials.INSTANCE.flush();
@@ -576,7 +586,7 @@ public final class RtComposite {
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
             deferredTlas.add(new DeferredTlas(frameCounter + KEEP_FRAMES, frameTlas));
 
-            // P6.4: push only the 8-byte device address of this frame's filled push-data slot.
+            // Push only the 8-byte device address of this frame's filled push-data slot.
             ByteBuffer pushAddr = stack.malloc(Long.BYTES).putLong(0, pushBuf.deviceAddress);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace")) {
                 active.trace(cmd, renderW, renderH, pushAddr);
@@ -585,9 +595,8 @@ public final class RtComposite {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure")) {
                 exposure.record(ctx, cmd, stack, output);
             }
-            // P4.2b: DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
-            // RR reads them and writes the display-res denoised result straight into rrOutput, which
-            // the display mapper reads. No copy-back: render and display sizes now differ.
+            // DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
+            // RR reads them and writes the display-res denoised result straight into rrOutput.
             if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
                 // DLSS expects the reported jitter to be the NEGATION of what was added to the
@@ -629,21 +638,20 @@ public final class RtComposite {
     }
 
     /**
-     * P6.3 dynamic sky. Derive the celestial light from Minecraft's time of day and write it into the
-     * world push constant (three 16-byte-aligned vec4s at offsets 208/224/240):
+     * Derive the celestial light from Minecraft's time of day and write it into the world push constant
+     * (three 16-byte-aligned vec4s at offsets 208/224/240):
      * <ul>
      *   <li>{@code sunDir.xyz} — the true sun direction (for the sky glow/disc), {@code .w} = dayFactor
      *       (0 night .. 1 day), used to cross-fade the sky gradient.</li>
      *   <li>{@code lightDir.xyz} — the active NEE light direction: the sun while it is above the horizon,
      *       otherwise the moon (so surfaces still get soft moonlight at night); {@code .w} = the light's
-     *       angular radius in radians (P6.3b soft shadows; 0 when {@code softShadows=false}).</li>
+     *       angular radius in radians ({@code softShadows=false} → 0).</li>
      *   <li>{@code lightRadiance.xyz} — that light's HDR colour: warm + dim near the horizon, white +
      *       bright when high; dim cool moonlight at night.</li>
      * </ul>
-     * 26.2 exposes the celestial angles via the camera's {@link EnvironmentAttributeProbe} (partial-tick
+     * Celestial angles come from the camera's {@link EnvironmentAttributeProbe} (partial-tick
      * interpolated). {@code upscaler.rt.sunNoonSouthDeg} tilts the east-west arc toward south (+Z) at
-     * noon while keeping sunrise/sunset on the east-west horizon. {@code dynamicSky=false} pins the
-     * legacy fixed noon sun (P3.1a constants) for an exact A/B.
+     * noon. {@code dynamicSky=false} pins a fixed noon sun.
      */
     private void writeSky(ByteBuffer push) {
         float sunX, sunY, sunZ, dayFactor, lx, ly, lz, rr, rg, rb, lightRadius;
@@ -653,7 +661,7 @@ public final class RtComposite {
             Vector3f s = new Vector3f(0.35f, 0.9f, 0.25f).normalize();
             sunX = s.x; sunY = s.y; sunZ = s.z; dayFactor = 1f;
             lx = s.x; ly = s.y; lz = s.z;
-            rr = 4.2f; rg = 4.0f; rb = 3.6f; // P3.1a SUN_RADIANCE
+            rr = 4.2f; rg = 4.0f; rb = 3.6f; // fixed noon sun radiance
             lightRadius = SOFT_SHADOWS ? SUN_ANGULAR_RADIUS : 0f;
             // Fixed-sky A/B: park the moon opposite the sun, full phase, no stars (daylit).
             moonX = -s.x; moonY = -s.y; moonZ = -s.z; moonPhase = 0f; starAngle = 0f; starBrightness = 0f;
@@ -738,7 +746,7 @@ public final class RtComposite {
         if (deferredTlas.isEmpty()) {
             return;
         }
-        java.util.Iterator<DeferredTlas> it = deferredTlas.iterator();
+        Iterator<DeferredTlas> it = deferredTlas.iterator();
         while (it.hasNext()) {
             DeferredTlas d = it.next();
             if (d.freeFrame() <= frameCounter) {

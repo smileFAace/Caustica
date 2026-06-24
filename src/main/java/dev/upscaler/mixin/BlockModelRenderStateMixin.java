@@ -1,8 +1,8 @@
 package dev.upscaler.mixin;
 
 import com.mojang.blaze3d.vertex.PoseStack;
-import dev.upscaler.rt.ContainedBlockSource;
-import dev.upscaler.rt.RtEntityCollector;
+import dev.upscaler.rt.entity.ContainedBlockSource;
+import dev.upscaler.rt.entity.RtEntityCollector;
 import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.block.BlockModelRenderState;
 import net.minecraft.world.level.block.state.BlockState;

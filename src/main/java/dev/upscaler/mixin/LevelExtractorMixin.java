@@ -1,6 +1,6 @@
 package dev.upscaler.mixin;
 
-import dev.upscaler.rt.RtTerrain;
+import dev.upscaler.rt.terrain.RtTerrain;
 import net.minecraft.client.renderer.extract.LevelExtractor;
 import net.minecraft.core.BlockPos;
 import org.spongepowered.asm.mixin.Mixin;

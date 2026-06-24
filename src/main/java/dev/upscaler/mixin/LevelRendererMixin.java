@@ -3,7 +3,7 @@ package dev.upscaler.mixin;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import dev.upscaler.client.VanillaRenderController;
-import dev.upscaler.rt.RtTerrain;
+import dev.upscaler.rt.terrain.RtTerrain;
 import net.minecraft.client.DeltaTracker;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.state.level.CameraRenderState;

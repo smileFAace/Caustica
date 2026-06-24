@@ -1,9 +1,17 @@
-package dev.upscaler.rt;
+package dev.upscaler.rt.terrain;
 
 import com.mojang.blaze3d.vertex.QuadInstance;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.mixin.SpriteContentsAccessor;
+import dev.upscaler.rt.RtComposite;
+import dev.upscaler.rt.RtContext;
+import dev.upscaler.rt.RtDebugLabels;
+import dev.upscaler.rt.RtDeviceBringup;
+import dev.upscaler.rt.accel.RtAccel;
+import dev.upscaler.rt.accel.RtBuffer;
+import dev.upscaler.rt.material.RtBlockMaterials;
+import dev.upscaler.rt.material.RtMaterials;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import com.mojang.blaze3d.platform.NativeImage;
@@ -42,10 +50,9 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
-import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * P2 step 3: per-section terrain residency synced to vanilla's loaded chunks. A singleton manager
+ * Per-section terrain residency synced to vanilla's loaded chunks. A singleton manager
  * keeps a map of resident 16³ sections; each tick it polls the render-distance window around the
  * player, builds newly-in-range sections (capped per tick) and frees out-of-range ones, then rebuilds
  * the section table + TLAS when the set changed. Residency follows vanilla because a section is only
@@ -83,39 +90,6 @@ public final class RtTerrain {
     private static final int SECTION_ENTRY_BYTES = 40; // {u64 primAddr, u64 idxAddr, u64 uvAddr, u32 triBase[3], u32 waterGeom}
     // Sentinel for "this section has no water geometry": no gl_GeometryIndexEXT (0..2) can equal it.
     private static final int NO_WATER_GEOM = 0xFFFFFFFF;
-    // Terrain OMM: 4-state encoding, conservative by construction. Unknown-opaque still invokes the
-    // existing any-hit alpha test; fully-opaque microtriangles skip it in traversal.
-    // Level 4 -> a 16x16 micro-grid that aligns 1:1 with MC's 16x16 texel grid, so each
-    // micro-triangle covers (half of) a single texel and classifies cleanly.
-    private static final int OMM_SUBDIVISION = Integer.getInteger("upscaler.rt.ommSubdivision", 4);
-    private static final int OMM_FULLY_TRANSPARENT = 0;
-    private static final int OMM_FULLY_OPAQUE = 1;
-    private static final int OMM_UNKNOWN_OPAQUE = 3;
-    private static final int OMM_CLASS_MIXED = -1;
-    private static final int OMM_CLASS_UNSAFE = -2;
-    private static final int OMM_ALPHA_CUTOFF = 128; // any-hit uses alpha >= 0.5 as visible
-    private static final byte OMM_UNKNOWN_OPAQUE_BYTE = (byte) (OMM_UNKNOWN_OPAQUE | (OMM_UNKNOWN_OPAQUE << 2)
-            | (OMM_UNKNOWN_OPAQUE << 4) | (OMM_UNKNOWN_OPAQUE << 6));
-    private static final boolean OMM_STATS = Boolean.getBoolean("upscaler.rt.ommStats");
-    // A triangle's micromap depends only on (sprite, UV triple, level) — never on world position — so
-    // identical cutout faces (every leaves/grass block in view, every dirty re-extract) reuse one result.
-    // Keyed by sprite identity, so it is cleared on resource reload (markAllDirty) when the atlas changes.
-    private static final Map<OmmTriangleKey, OmmTriangleResult> OMM_TRIANGLE_CACHE = new ConcurrentHashMap<>();
-    private static final long OMM_STATS_INTERVAL_NANOS = 5_000_000_000L;
-    private static final AtomicLong OMM_STATS_SECTIONS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_CUTOUT_SECTIONS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_MICROMAP_SECTIONS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_CUTOUT_TRIS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_OPAQUE_MICROS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_TRANSPARENT_MICROS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_MIXED_MICROS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_UNSAFE_MICROS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_NULL_SPRITE_MICROS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_TOTAL_MICROS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_ANIMATED_TRIS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_NULL_SPRITE_TRIS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_DISABLED_SECTIONS = new AtomicLong();
-    private static final AtomicLong OMM_STATS_LAST_LOG = new AtomicLong();
     // Frames a retired resource must outlive before it's freed (> frames-in-flight). The frame counter
     // advances per composite; old TLAS/table/sections are freed this many frames after the swap.
     private static final int KEEP_FRAMES = 4;
@@ -242,7 +216,7 @@ public final class RtTerrain {
      */
     public static void markAllDirty() {
         // The atlas (and thus sprite identities + UVs) changed — drop cached per-triangle classifications.
-        clearOmmCache();
+        RtTerrainOmm.clearCache();
         INSTANCE.reresolveAllRequested = true;
     }
 
@@ -454,7 +428,8 @@ public final class RtTerrain {
                                               FluidRenderer fluidRenderer, FluidCapture fluidCapture,
                                               BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
         SectionMesh mesh = tessellate(region, modelSet, renderer, capture, fluidRenderer, fluidCapture, m, scx, scy, scz);
-        RtAccel.OpacityMicromapInput ommInput = mesh.isEmpty() ? null : buildOpacityMicromapInput(mesh.cutout);
+        RtAccel.OpacityMicromapInput ommInput = mesh.isEmpty() ? null :
+                RtTerrainOmm.buildInput(mesh.cutout.triCount(), mesh.cutout.cornerUv.elements(), mesh.cutout.ommSprites);
         return new CpuSection(mesh, ommInput);
     }
 
@@ -479,12 +454,12 @@ public final class RtTerrain {
                     // Fluids (water/lava, incl. waterlogged blocks): separate mesher, INVISIBLE render
                     // shape, so handled independently of the block model below. FluidRenderer emits
                     // section-local coords + atlas sprite UVs straight into the capturing consumer.
-                    // Lava's block light (15) rides the same emission channel as P3.2a (water emits 0).
+                    // Lava's block light (15) rides the emission channel (water emits 0).
                     FluidState fluid = state.getFluidState();
                     if (!fluid.isEmpty()) {
                         fluidCapture.emission = state.getLightEmission() / 15f;
-                        // Water is the dielectric fluid (P5.2 translucency/refraction); lava stays an
-                        // opaque emitter. Tagged per-prim so the path tracer can branch (see emitQuad).
+                        // Water is the dielectric fluid; lava stays an opaque emitter. Tagged per-prim
+                        // so the path tracer can branch (see emitQuad).
                         fluidCapture.water = fluid.is(FluidTags.WATER);
                         try {
                             fluidRenderer.tesselate(region, m, fluidCapture, state, fluid);
@@ -617,386 +592,6 @@ public final class RtTerrain {
         }
     }
 
-    private static RtAccel.OpacityMicromapInput buildOpacityMicromapInput(Geom cutout) {
-        if (!RtDeviceBringup.ommEnabled()) {
-            recordOmmStatsDisabled();
-            return null;
-        }
-        int triCount = cutout.triCount();
-        if (triCount == 0 || cutout.ommSprites.size() != triCount) {
-            recordOmmStats(triCount, 0, 0, 0, 0, 0, 0, 0, 0, 0, false);
-            return null;
-        }
-        int level = opacityMicromapSubdivisionLevel();
-        int microCount = 1 << (level * 2);
-        int bytesPerTriangle = Math.max(1, (microCount * 2 + 7) >>> 3);
-        byte[] data = new byte[triCount * bytesPerTriangle];
-        java.util.Arrays.fill(data, OMM_UNKNOWN_OPAQUE_BYTE);
-
-        int opaqueMicroTriangles = 0;
-        int transparentMicroTriangles = 0;
-        int mixedMicroTriangles = 0;
-        int unsafeMicroTriangles = 0;
-        int nullSpriteMicroTriangles = 0;
-        int animatedTris = 0;
-        int nullSpriteTris = 0;
-        float[] cornerUv = cutout.cornerUv.elements();
-        for (int t = 0; t < triCount; t++) {
-            TextureAtlasSprite sprite = cutout.ommSprites.get(t);
-            if (sprite == null) {
-                nullSpriteTris++;
-                nullSpriteMicroTriangles += microCount;
-                continue;
-            }
-            if (sprite.transparency().isOpaque()) {
-                for (int m = 0; m < microCount; m++) {
-                    writeOmmValue(data, t, bytesPerTriangle, m, OMM_FULLY_OPAQUE);
-                }
-                opaqueMicroTriangles += microCount;
-                continue;
-            }
-            if (sprite.isAnimated()) {
-                animatedTris++;
-            }
-            OmmTriangleResult result = classifyTriangleCached(level, bytesPerTriangle, sprite, cornerUv, t);
-            System.arraycopy(result.data(), 0, data, t * bytesPerTriangle, bytesPerTriangle);
-            OmmMicroCounts counts = result.counts();
-            opaqueMicroTriangles += counts.opaque();
-            transparentMicroTriangles += counts.transparent();
-            mixedMicroTriangles += counts.mixed();
-            unsafeMicroTriangles += counts.unsafe();
-        }
-        int classifiedMicroTriangles = opaqueMicroTriangles + transparentMicroTriangles;
-        recordOmmStats(triCount, level, microCount, opaqueMicroTriangles, transparentMicroTriangles,
-                mixedMicroTriangles, unsafeMicroTriangles, nullSpriteMicroTriangles, animatedTris, nullSpriteTris,
-                classifiedMicroTriangles > 0);
-        if (classifiedMicroTriangles == 0) {
-            return null;
-        }
-        return new RtAccel.OpacityMicromapInput(data, triCount, level, bytesPerTriangle);
-    }
-
-    private static void recordOmmStatsDisabled() {
-        if (!OMM_STATS) {
-            return;
-        }
-        OMM_STATS_SECTIONS.incrementAndGet();
-        OMM_STATS_DISABLED_SECTIONS.incrementAndGet();
-        maybeLogOmmStats(0);
-    }
-
-    private static void recordOmmStats(int triCount, int level, int microCount, int opaqueMicroTriangles,
-                                       int transparentMicroTriangles, int mixedMicroTriangles,
-                                       int unsafeMicroTriangles, int nullSpriteMicroTriangles,
-                                       int animatedTris, int nullSpriteTris, boolean emitted) {
-        if (!OMM_STATS) {
-            return;
-        }
-        OMM_STATS_SECTIONS.incrementAndGet();
-        if (triCount > 0) {
-            OMM_STATS_CUTOUT_SECTIONS.incrementAndGet();
-            OMM_STATS_CUTOUT_TRIS.addAndGet(triCount);
-            OMM_STATS_TOTAL_MICROS.addAndGet((long) triCount * microCount);
-            OMM_STATS_OPAQUE_MICROS.addAndGet(opaqueMicroTriangles);
-            OMM_STATS_TRANSPARENT_MICROS.addAndGet(transparentMicroTriangles);
-            OMM_STATS_MIXED_MICROS.addAndGet(mixedMicroTriangles);
-            OMM_STATS_UNSAFE_MICROS.addAndGet(unsafeMicroTriangles);
-            OMM_STATS_NULL_SPRITE_MICROS.addAndGet(nullSpriteMicroTriangles);
-            OMM_STATS_ANIMATED_TRIS.addAndGet(animatedTris);
-            OMM_STATS_NULL_SPRITE_TRIS.addAndGet(nullSpriteTris);
-        }
-        if (emitted) {
-            OMM_STATS_MICROMAP_SECTIONS.incrementAndGet();
-        }
-        maybeLogOmmStats(level);
-    }
-
-    private static void maybeLogOmmStats(int level) {
-        long now = System.nanoTime();
-        long last = OMM_STATS_LAST_LOG.get();
-        if (last != 0L && now - last < OMM_STATS_INTERVAL_NANOS) {
-            return;
-        }
-        if (!OMM_STATS_LAST_LOG.compareAndSet(last, now)) {
-            return;
-        }
-        long totalMicros = OMM_STATS_TOTAL_MICROS.get();
-        long opaqueMicros = OMM_STATS_OPAQUE_MICROS.get();
-        long transparentMicros = OMM_STATS_TRANSPARENT_MICROS.get();
-        long mixedMicros = OMM_STATS_MIXED_MICROS.get();
-        long unsafeMicros = OMM_STATS_UNSAFE_MICROS.get();
-        long nullSpriteMicros = OMM_STATS_NULL_SPRITE_MICROS.get();
-        long unknownMicros = Math.max(0L, totalMicros - opaqueMicros - transparentMicros);
-        double opaquePct = totalMicros == 0 ? 0.0 : (opaqueMicros * 100.0) / totalMicros;
-        double transparentPct = totalMicros == 0 ? 0.0 : (transparentMicros * 100.0) / totalMicros;
-        double unknownPct = totalMicros == 0 ? 0.0 : (unknownMicros * 100.0) / totalMicros;
-        UpscalerMod.LOGGER.info(
-                "RT terrain OMM stats: enabled={}, level={}, sections={}, cutoutSections={}, micromapSections={}, "
-                        + "cutoutTris={}, opaqueMicros={}/{} ({}%), transparentMicros={}/{} ({}%), "
-                        + "unknownMicros={}/{} ({}%; mixed={}, unsafe={}, nullSprite={}), "
-                        + "animatedTris={}, nullSpriteTris={}, disabledSections={}",
-                RtDeviceBringup.ommEnabled(), level, OMM_STATS_SECTIONS.get(), OMM_STATS_CUTOUT_SECTIONS.get(),
-                OMM_STATS_MICROMAP_SECTIONS.get(), OMM_STATS_CUTOUT_TRIS.get(), opaqueMicros, totalMicros,
-                String.format(java.util.Locale.ROOT, "%.1f", opaquePct), transparentMicros, totalMicros,
-                String.format(java.util.Locale.ROOT, "%.1f", transparentPct), unknownMicros, totalMicros,
-                String.format(java.util.Locale.ROOT, "%.1f", unknownPct), mixedMicros, unsafeMicros, nullSpriteMicros,
-                OMM_STATS_ANIMATED_TRIS.get(), OMM_STATS_NULL_SPRITE_TRIS.get(), OMM_STATS_DISABLED_SECTIONS.get());
-    }
-
-    private static int opacityMicromapSubdivisionLevel() {
-        int max = Math.max(0, Math.min(12, RtDeviceBringup.maxOpacity4StateSubdivisionLevel()));
-        return Math.max(0, Math.min(OMM_SUBDIVISION, max));
-    }
-
-    private record OmmMicroCounts(int opaque, int transparent, int mixed, int unsafe) {
-    }
-
-    /** Cache key: a triangle's classification depends only on its sprite, UV triple, and subdivision level. */
-    private record OmmTriangleKey(TextureAtlasSprite sprite, int level,
-                                  float u0, float v0, float u1, float v1, float u2, float v2) {
-    }
-
-    /** Cached classification of one triangle: its {@code bytesPerTriangle}-sized micromap block + tallies. */
-    private record OmmTriangleResult(byte[] data, OmmMicroCounts counts) {
-    }
-
-    public static void clearOmmCache() {
-        OMM_TRIANGLE_CACHE.clear();
-    }
-
-    private static OmmTriangleResult classifyTriangleCached(int level, int bytesPerTriangle, TextureAtlasSprite sprite,
-                                                            float[] cornerUv, int tri) {
-        int o = tri * 6; // 6 floats/triangle: (u0,v0, u1,v1, u2,v2) in primitive order
-        OmmTriangleKey key = new OmmTriangleKey(sprite, level,
-                cornerUv[o], cornerUv[o + 1], cornerUv[o + 2], cornerUv[o + 3], cornerUv[o + 4], cornerUv[o + 5]);
-        return OMM_TRIANGLE_CACHE.computeIfAbsent(key, k -> classifyTriangle(level, bytesPerTriangle, k.sprite(),
-                k.u0(), k.v0(), k.u1(), k.v1(), k.u2(), k.v2()));
-    }
-
-    private static OmmTriangleResult classifyTriangle(int level, int bytesPerTriangle, TextureAtlasSprite sprite,
-                                                      float u0, float v0, float u1, float v1, float u2, float v2) {
-        byte[] data = new byte[bytesPerTriangle];
-        java.util.Arrays.fill(data, OMM_UNKNOWN_OPAQUE_BYTE);
-        int grid = 1 << level;
-        float invGrid = 1.0f / grid;
-        // counts[0..3] = opaque, transparent, mixed, unsafe. Triangle index 0 -> block-local offset 0.
-        int[] counts = new int[4];
-        for (int i = 0; i < grid; i++) {
-            for (int j = 0; i + j < grid; j++) {
-                // Upright micro-triangle: corners (i,j) (i+1,j) (i,j+1).
-                classifyMicroTriangle(data, 0, bytesPerTriangle, level, sprite, u0, v0, u1, v1, u2, v2,
-                        i, j, i + 1, j, i, j + 1, invGrid,
-                        (i + 1.0f / 3.0f) * invGrid, (j + 1.0f / 3.0f) * invGrid, counts);
-                // Inverted micro-triangle: corners (i+1,j) (i+1,j+1) (i,j+1).
-                if (i + j < grid - 1) {
-                    classifyMicroTriangle(data, 0, bytesPerTriangle, level, sprite, u0, v0, u1, v1, u2, v2,
-                            i + 1, j, i + 1, j + 1, i, j + 1, invGrid,
-                            (i + 2.0f / 3.0f) * invGrid, (j + 2.0f / 3.0f) * invGrid, counts);
-                }
-            }
-        }
-        return new OmmTriangleResult(data, new OmmMicroCounts(counts[0], counts[1], counts[2], counts[3]));
-    }
-
-    /**
-     * Classify one micro-triangle (corners given in integer grid coordinates), write its OMM state
-     * when it is uniformly opaque/transparent, and tally the outcome into {@code counts}
-     * (opaque, transparent, mixed, unsafe).
-     */
-    private static void classifyMicroTriangle(byte[] data, int tri, int bytesPerTriangle, int level,
-                                              TextureAtlasSprite sprite, float u0, float v0, float u1, float v1,
-                                              float u2, float v2, int gi0, int gj0, int gi1, int gj1, int gi2, int gj2,
-                                              float invGrid, float centroidB, float centroidC, int[] counts) {
-        int state = microTriangleOmmState(sprite, u0, v0, u1, v1, u2, v2,
-                gi0 * invGrid, gj0 * invGrid, gi1 * invGrid, gj1 * invGrid, gi2 * invGrid, gj2 * invGrid);
-        switch (state) {
-            case OMM_FULLY_OPAQUE -> {
-                writeClassifiedOmmValue(data, tri, bytesPerTriangle, level, centroidB, centroidC, state);
-                counts[0]++;
-            }
-            case OMM_FULLY_TRANSPARENT -> {
-                writeClassifiedOmmValue(data, tri, bytesPerTriangle, level, centroidB, centroidC, state);
-                counts[1]++;
-            }
-            case OMM_CLASS_MIXED -> counts[2]++;
-            default -> counts[3]++;
-        }
-    }
-
-    private static void writeClassifiedOmmValue(byte[] data, int tri, int bytesPerTriangle, int level,
-                                                float b, float c, int state) {
-        int microIndex = barycentricsToOmmIndex(b, c, level);
-        writeOmmValue(data, tri, bytesPerTriangle, microIndex, state);
-    }
-
-    private static int microTriangleOmmState(TextureAtlasSprite sprite, float u0, float v0, float u1, float v1,
-                                             float u2, float v2, float b0, float c0, float b1, float c1,
-                                             float b2, float c2) {
-        float tu0 = triangleUv(u0, u1, u2, b0, c0);
-        float tv0 = triangleUv(v0, v1, v2, b0, c0);
-        float tu1 = triangleUv(u0, u1, u2, b1, c1);
-        float tv1 = triangleUv(v0, v1, v2, b1, c1);
-        float tu2 = triangleUv(u0, u1, u2, b2, c2);
-        float tv2 = triangleUv(v0, v1, v2, b2, c2);
-        float minU = Math.min(tu0, Math.min(tu1, tu2));
-        float maxU = Math.max(tu0, Math.max(tu1, tu2));
-        float minV = Math.min(tv0, Math.min(tv1, tv2));
-        float maxV = Math.max(tv0, Math.max(tv1, tv2));
-        return spriteRegionOmmState(sprite, minU, minV, maxU, maxV);
-    }
-
-    private static float triangleUv(float v0, float v1, float v2, float b, float c) {
-        return v0 + (v1 - v0) * b + (v2 - v0) * c;
-    }
-
-    private static int spriteRegionOmmState(TextureAtlasSprite sprite, float minU, float minV, float maxU, float maxV) {
-        if (!Float.isFinite(minU) || !Float.isFinite(minV) || !Float.isFinite(maxU) || !Float.isFinite(maxV)) {
-            return OMM_CLASS_UNSAFE;
-        }
-        float spanU = sprite.getU1() - sprite.getU0();
-        float spanV = sprite.getV1() - sprite.getV0();
-        if (Math.abs(spanU) < 1.0e-12f || Math.abs(spanV) < 1.0e-12f) {
-            return OMM_CLASS_UNSAFE;
-        }
-        float localMinU = (minU - sprite.getU0()) / spanU;
-        float localMaxU = (maxU - sprite.getU0()) / spanU;
-        float localMinV = (minV - sprite.getV0()) / spanV;
-        float localMaxV = (maxV - sprite.getV0()) / spanV;
-        if (localMinU > localMaxU) {
-            float tmp = localMinU;
-            localMinU = localMaxU;
-            localMaxU = tmp;
-        }
-        if (localMinV > localMaxV) {
-            float tmp = localMinV;
-            localMinV = localMaxV;
-            localMaxV = tmp;
-        }
-        var contents = sprite.contents();
-        // Tolerance is for the out-of-range UNSAFE check ONLY. Do NOT add it to the sampled
-        // region: a half-texel pad makes every micro-triangle's footprint floor()/ceil() into
-        // its neighbour texels on all four sides, so any cutout texture classifies MIXED.
-        float tolU = 0.5f / Math.max(1, contents.width());
-        float tolV = 0.5f / Math.max(1, contents.height());
-        if (localMinU < -tolU || localMaxU > 1.0f + tolU || localMinV < -tolV || localMaxV > 1.0f + tolV) {
-            return OMM_CLASS_UNSAFE;
-        }
-        localMinU = clamp01(localMinU);
-        localMaxU = clamp01(localMaxU);
-        localMinV = clamp01(localMinV);
-        localMaxV = clamp01(localMaxV);
-        return spriteRegionCutoutState(contents, localMinU, localMinV, localMaxU, localMaxV);
-    }
-
-    private static int spriteRegionCutoutState(net.minecraft.client.renderer.texture.SpriteContents contents,
-                                               float minU, float minV, float maxU, float maxV) {
-        int width = contents.width();
-        int height = contents.height();
-        // Inset by a sub-texel epsilon so a footprint whose edges sit exactly on texel
-        // boundaries (the common case once the micro-grid aligns to the texture grid)
-        // resolves to the texels it truly covers, instead of bleeding into the neighbour
-        // texel through floor()/ceil() floating-point noise at the boundary.
-        final float eps = 1.0e-3f;
-        int x0 = Math.max(0, Math.min(width, (int) Math.floor(minU * width + eps)));
-        int y0 = Math.max(0, Math.min(height, (int) Math.floor(minV * height + eps)));
-        int x1 = Math.max(0, Math.min(width, (int) Math.ceil(maxU * width - eps)));
-        int y1 = Math.max(0, Math.min(height, (int) Math.ceil(maxV * height - eps)));
-        // A footprint narrower than one texel still has to sample the texel containing it.
-        if (x1 <= x0) {
-            x1 = Math.min(width, x0 + 1);
-        }
-        if (y1 <= y0) {
-            y1 = Math.min(height, y0 + 1);
-        }
-        if (x0 >= x1 || y0 >= y1) {
-            return OMM_CLASS_UNSAFE;
-        }
-        var image = ((SpriteContentsAccessor) contents).upscaler$originalImage();
-        int frameRowSize = Math.max(1, image.getWidth() / Math.max(1, width));
-        var frames = contents.getUniqueFrames();
-        boolean anyPass = false;
-        boolean anyFail = false;
-        int frameCount = contents.isAnimated() ? frames.size() : 1;
-        for (int f = 0; f < frameCount; f++) {
-            int frame = contents.isAnimated() ? frames.getInt(f) : 0;
-            int frameX = (frame % frameRowSize) * width;
-            int frameY = (frame / frameRowSize) * height;
-            for (int y = y0; y < y1; y++) {
-                for (int x = x0; x < x1; x++) {
-                    int alpha = ARGB.alpha(image.getPixel(frameX + x, frameY + y));
-                    if (alpha >= OMM_ALPHA_CUTOFF) {
-                        anyPass = true;
-                    } else {
-                        anyFail = true;
-                    }
-                    if (anyPass && anyFail) {
-                        return OMM_CLASS_MIXED;
-                    }
-                }
-            }
-        }
-        if (anyPass) {
-            return OMM_FULLY_OPAQUE;
-        }
-        return anyFail ? OMM_FULLY_TRANSPARENT : OMM_CLASS_UNSAFE;
-    }
-
-    private static float clamp01(float v) {
-        return Math.max(0.0f, Math.min(1.0f, v));
-    }
-
-    private static void writeOmmValue(byte[] data, int triangle, int bytesPerTriangle, int microIndex, int value) {
-        int bit = (triangle * bytesPerTriangle << 3) + microIndex * 2;
-        int byteIndex = bit >>> 3;
-        int shift = bit & 7;
-        int mask = 0x3 << shift;
-        int cur = data[byteIndex] & 0xFF;
-        data[byteIndex] = (byte) ((cur & ~mask) | ((value & 0x3) << shift));
-    }
-
-    private static int barycentricsToOmmIndex(float u, float v, int level) {
-        u = clamp01(u);
-        v = clamp01(v);
-        int dim = 1 << level;
-        float fu = u * dim;
-        float fv = v * dim;
-        int iu = (int) fu;
-        int iv = (int) fv;
-        float uf = fu - iu;
-        float vf = fv - iv;
-        if (iu >= dim) {
-            iu = dim - 1;
-        }
-        if (iv >= dim) {
-            iv = dim - 1;
-        }
-        int iuv = iu + iv;
-        if (iuv >= dim) {
-            iu -= iuv - dim + 1;
-        }
-        int iw = ~(iu + iv);
-        if (uf + vf >= 1.0f && iuv < dim - 1) {
-            --iw;
-        }
-        int b0 = ~(iu ^ iw);
-        b0 &= dim - 1;
-        int t = (iu ^ iv) & b0;
-        int f = t;
-        f ^= f >>> 1;
-        f ^= f >>> 2;
-        f ^= f >>> 4;
-        f ^= f >>> 8;
-        int b1 = ((f ^ iu) & ~b0) | t;
-        b0 = (b0 | (b0 << 8)) & 0x00ff00ff;
-        b0 = (b0 | (b0 << 4)) & 0x0f0f0f0f;
-        b0 = (b0 | (b0 << 2)) & 0x33333333;
-        b0 = (b0 | (b0 << 1)) & 0x55555555;
-        b1 = (b1 | (b1 << 8)) & 0x00ff00ff;
-        b1 = (b1 | (b1 << 4)) & 0x0f0f0f0f;
-        b1 = (b1 | (b1 << 2)) & 0x33333333;
-        b1 = (b1 | (b1 << 1)) & 0x55555555;
-        return b0 | (b1 << 1);
-    }
 
     /**
      * ASYNC: snapshot each missing section on the render thread and submit its tessellation to the worker
@@ -1443,10 +1038,10 @@ public final class RtTerrain {
 
             // Emissive: vanilla block light level (0..15) -> 0..1, stashed in the free normal.w slot.
             q.emission = state != null ? state.getLightEmission() / 15f : 0f;
-            // P6.1: heuristic PBR material (roughness, metalness) for the GGX BRDF / DLSS-RR guides.
+            // Heuristic PBR material (roughness, metalness) for the GGX BRDF / DLSS-RR guides.
             q.rough = RtMaterials.roughness(state);
             q.metal = RtMaterials.metalness(state);
-            // P6.2a/b: the sprite's LabPBR maps get ingested into the parallel atlases (deferred to the render
+            // The sprite's LabPBR maps get ingested into the parallel atlases (deferred to the render
             // thread); record the sprite per triangle, resolveMaterials() patches hasS/hasN before upload.
             TextureAtlasSprite sprite = quad.materialInfo().sprite();
             q.sprite = sprite;
@@ -1639,10 +1234,10 @@ public final class RtTerrain {
      * compute a geometric normal (sign is irrelevant — the closest-hit flips it toward the viewer), and
      * emit two triangles like {@link QuadCapture}. Coords are already section-local (FluidRenderer uses
      * {@code pos & 15}). The cardinal-lit vertex colour is dropped — albedo comes from the atlas in the
-     * hit shader, same as blocks. Tint is left white (biome water tint is deferred to P5 water work).
+     * hit shader, same as blocks. Tint is left white (biome water tint is a deferred item).
      *
-     * <p>P5.2: water faces are tagged in the per-prim {@code tint.w} slot ({@code 1.0} = water) so the
-     * path tracer treats them as a smooth dielectric (Fresnel reflection + refraction + Beer–Lambert
+     * <p>Water faces are tagged in the per-prim {@code tint.w} slot ({@code 1.0} = water) so the path
+     * tracer treats them as a smooth dielectric (Fresnel reflection + refraction + Beer–Lambert
      * absorption). Lava keeps {@code tint.w == 0.0} and stays an opaque emitter.
      */
     private static final class FluidCapture implements VertexConsumer, FluidRenderer.Output {
@@ -1702,7 +1297,7 @@ public final class RtTerrain {
                 nz /= len;
             }
             float material = water ? 1f : 0f; // tint.w: 1 = water dielectric, 0 = opaque (lava)
-            // P6.1: water is a near-smooth dielectric; lava is a moderately rough opaque emitter.
+            // Water is a near-smooth dielectric; lava is a moderately rough opaque emitter.
             float rough = water ? RtMaterials.WATER_ROUGH : RtMaterials.LAVA_ROUGH;
             FloatArrayList prim = g.prim;
             for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle

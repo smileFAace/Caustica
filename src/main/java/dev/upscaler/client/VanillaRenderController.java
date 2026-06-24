@@ -4,7 +4,7 @@ import com.mojang.blaze3d.pipeline.RenderTarget;
 import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtComposite;
 import dev.upscaler.rt.RtContext;
-import dev.upscaler.rt.RtTerrain;
+import dev.upscaler.rt.terrain.RtTerrain;
 
 public final class VanillaRenderController {
 	public static final VanillaRenderController INSTANCE = new VanillaRenderController();
