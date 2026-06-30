@@ -118,7 +118,8 @@ sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
 def requiredNgxNatives = [
 	file("native/ngx_shim/out/Release/ngxshim.dll"),
-	file("native/ngx_shim/out/Release/nvngx_dlssd.dll")
+	file("native/ngx_shim/out/Release/nvngx_dlssd.dll"),
+	file("native/ngx_shim/out/Release/nvngx_dlssg.dll")
 ]
 
 def bundleNgxNatives = tasks.register("bundleNgxNatives", Copy) {

@@ -39,7 +39,7 @@ public final class NgxRuntime {
     // Feature DLLs extracted next to the shim so NGX can load them at init. Add nvngx_dlssg.dll here when
     // Frame Generation is bundled. Missing ones are skipped (the corresponding feature just reports
     // unavailable).
-    private static final String[] FEATURE_DLLS = {"nvngx_dlssd.dll"};
+    private static final String[] FEATURE_DLLS = {"nvngx_dlssd.dll", "nvngx_dlssg.dll"};
 
     private NgxLibrary lib;
     private boolean initialized;
