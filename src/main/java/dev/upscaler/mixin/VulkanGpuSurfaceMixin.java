@@ -179,6 +179,16 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (RtDeviceBringup.reflexEnabled()) {
 			RtReflex.INSTANCE.applySleepMode(this.device.vkDevice(), this.swapchain);
 		}
+		// DLSS-FG diagnostic: MAILBOX/IMMEDIATE present modes let a later present silently replace/skip an
+		// earlier queued-but-not-yet-scanned-out one, which would drop FG's generated frame before the
+		// display ever shows it — even though our vkQueuePresentKHR call itself reports success. FIFO is the
+		// only mode that guarantees every queued present gets its own vblank. Log once per (re)configure so
+		// this is checkable without guessing at the in-game V-Sync setting.
+		if (dev.upscaler.rt.pipeline.RtDlssFg.enabled()) {
+			UpscalerMod.LOGGER.info("DLSS-FG: swapchain present mode = {} (FIFO required for generated frames "
+					+ "to actually display; MAILBOX/IMMEDIATE will silently drop them — enable V-Sync if not FIFO)",
+					config.presentMode());
+		}
 	}
 
 	/**

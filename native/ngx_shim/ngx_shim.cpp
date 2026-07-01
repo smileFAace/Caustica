@@ -417,6 +417,16 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssg(VkCommandBuffer cmd,
     createParams.RenderHeight = renderHeight;
     createParams.DynamicResolutionScaling = false;
 
+    // User Interface Recomposition (UIR): a create-time-only decision (per
+    // nvsdk_ngx_defs_dlssg.h) that must be enabled here for ngxshim_evaluate_dlssg's optional
+    // HUDless/UI resources to actually be used by the algorithm. Without this, feeding HUDless+UI
+    // at eval time with UIR still off produces corrupted/undefined results specifically on fast-
+    // changing UI content (confirmed: F3 debug overlay / inventory tooltips visibly warped) rather
+    // than a clean no-op. Harmless to always enable: when eval doesn't supply HUDless/UI (both
+    // null), the algorithm just behaves like plain frame generation per the header's own docs
+    // ("generate output frames using the HUDless and UI textures if present").
+    NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled, 1);
+
     NVSDK_NGX_Handle* handle = nullptr;
     NVSDK_NGX_Result r = NGX_VK_CREATE_DLSSG(cmd, 1, 1, &handle, params, &createParams);
     g_lastResult = (int) r;
