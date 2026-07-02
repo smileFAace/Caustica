@@ -62,11 +62,12 @@ import java.util.concurrent.Future;
 
 /**
  * Per-section terrain residency synced to vanilla's loaded chunks. A singleton manager
- * keeps a map of resident 16³ sections; each tick it polls the render-distance window around the
- * player, builds newly-in-range sections (capped per tick) and frees out-of-range ones, then rebuilds
- * the section table + TLAS when the set changed. Residency follows vanilla because a section is only
- * "desired" when its chunk is loaded ({@code hasChunk}), so chunk load/unload drives build/free
- * without any mixin.
+ * keeps a map of resident 16³ sections. The 20 TPS tick maintains the desired window around the player
+ * (slid incrementally on section-boundary crossings) and drains dirty events; the actual streaming —
+ * snapshot dispatch, upload drain, batched BLAS build kick — runs once per render frame from
+ * {@link RtComposite} under a small wall-clock budget, so fill cost is a flat slice of every frame
+ * rather than a per-tick burst. Residency follows vanilla because a section is only "desired" when its
+ * chunk is loaded ({@code hasChunk}), so chunk load/unload drives build/free without any mixin.
  *
  * <p>Geometry comes from vanilla's {@link ModelBlockRenderer} (correct shapes, neighbour cull, biome
  * tint, alpha cutout). Vertices are section-local (f32-exact); each TLAS instance carries a
@@ -82,7 +83,9 @@ import java.util.concurrent.Future;
  */
 public final class RtTerrain {
     // CPU tessellation runs on RtWorkerPool. The render thread snapshots RenderSectionRegions, uploads
-    // completed meshes, prepares BLASes, and submits the GPU build.
+    // completed meshes, prepares BLASes, and submits the GPU build. Those render-thread pieces run as one
+    // "streaming pass" per render frame (driven by RtComposite), bounded by a wall-clock budget so the
+    // per-frame cost is flat instead of the old 20 TPS burst; the counts below are per-pass ceilings.
     private static int asyncDispatchPerTick() {
         return UpscalerConfig.Rt.Terrain.ASYNC_DISPATCH_PER_TICK.value();
     }
@@ -91,12 +94,24 @@ public final class RtTerrain {
         return UpscalerConfig.Rt.Terrain.SECTION_RESULTS_PER_TICK.value();
     }
 
-    private static int asyncDispatchMovingPerTick() {
-        return UpscalerConfig.Rt.Terrain.ASYNC_DISPATCH_MOVING_PER_TICK.value();
+    // Backlog (missing + queued re-extracts + in-flight jobs) at which the dynamic budget reaches max.
+    private static final int STREAM_PRESSURE_FULL_BACKLOG = 256;
+
+    /**
+     * Per-frame budget scaled by queue pressure: near-empty queues get the base slice, a big backlog
+     * (initial fill, F3+A, teleport, fast flight) ramps linearly to the max so fill throughput recovers —
+     * a few extra budgeted ms per frame only while the queue lasts.
+     */
+    private long dynamicStreamBudgetNanos() {
+        float base = UpscalerConfig.Rt.Terrain.STREAM_BUDGET_MS.value();
+        float max = Math.max(base, UpscalerConfig.Rt.Terrain.STREAM_BUDGET_MAX_MS.value());
+        int backlog = missing.size() + playerReextract.size() + reextract.size() + inFlight.size();
+        float t = Math.min(1f, backlog / (float) STREAM_PRESSURE_FULL_BACKLOG);
+        return (long) ((base + (max - base) * t) * 1_000_000f);
     }
 
-    private static int sectionResultsMovingPerTick() {
-        return UpscalerConfig.Rt.Terrain.SECTION_RESULTS_MOVING_PER_TICK.value();
+    private static long streamFallbackBudgetNanos() {
+        return (long) (UpscalerConfig.Rt.Terrain.STREAM_FALLBACK_BUDGET_MS.value() * 1_000_000f);
     }
 
     // Backpressure cap: stop dispatching once this many sections are in flight. Bounds queue depth and
@@ -114,6 +129,9 @@ public final class RtTerrain {
     private static final int PRIORITY_DIRTY = 1;
     private static final int PRIORITY_MISSING = 2;
     private static final long NO_DIRTY_GROUP = 0L;
+    // If no render frame has driven a streaming pass for this long, the 20 TPS tick takes over (loading
+    // screens / hidden window — states where a bigger budget can't hitch a visible frame).
+    private static final long STREAM_FALLBACK_AFTER_NANOS = 200_000_000L;
 
     private static int sectionTableInitialCapacity() {
         return UpscalerConfig.Rt.Terrain.SECTION_TABLE_INITIAL_CAPACITY.value();
@@ -146,6 +164,8 @@ public final class RtTerrain {
     private final LongOpenHashSet queuedPlayerReextract = new LongOpenHashSet();
     private final LongArrayList reextract = new LongArrayList();
     private final LongOpenHashSet queuedReextract = new LongOpenHashSet();
+    // Accumulators consumed by the next startBuild: window sync (tick) and upload drain (streaming pass)
+    // may run on different frames, so evicted geometry waits here until a build kick retires it.
     private final List<SectionGeom> removed = new ArrayList<>();
     private final List<PreparedSection> prepared = new ArrayList<>();
     private final RtBufferPool pool = new RtBufferPool();
@@ -192,11 +212,13 @@ public final class RtTerrain {
     public int blockZ;
     private boolean windowValid;
     private int windowPcx;
-    private int windowPsy;
     private int windowPcz;
     private int windowRadius;
     private int windowLoY;
     private int windowHiY;
+    // When the last streaming pass ran on a render frame — the tick fallback watches this (see
+    // STREAM_FALLBACK_AFTER_NANOS).
+    private long lastFrameStreamNanos;
 
     private RtTerrain() {
         missingPriority.defaultReturnValue(PRIORITY_MISSING);
@@ -233,9 +255,19 @@ public final class RtTerrain {
         return sectionTable.deviceAddress;
     }
 
-    /** Per-tick residency update (windowing + incremental build/free + TLAS rebuild on change). */
+    /** Per-tick residency update: window sync + dirty drain (plus the streaming fallback, see {@link #frame}). */
     public static void update(RtContext ctx) {
         INSTANCE.tick(ctx);
+    }
+
+    /**
+     * Per-render-frame streaming pass, driven by {@link RtComposite#composite}: finalize a completed BLAS
+     * build, dispatch snapshots to the worker pool and drain finished uploads — all bounded by
+     * {@code upscaler.rt.streamBudgetMs} of wall clock so the cost is a flat slice of every frame instead
+     * of a 20 TPS burst.
+     */
+    public static void frame(RtContext ctx) {
+        INSTANCE.frameStream(ctx);
     }
 
     public static void shutdown(RtContext ctx) {
@@ -329,18 +361,6 @@ public final class RtTerrain {
             }
         }
 
-        // One GPU build in flight at a time. When it finishes, finalize and FALL THROUGH so this same
-        // tick prepares the next batch — tick() runs at 20 TPS, so returning here would waste a whole
-        // tick per build and halve fill throughput. While the build is still running, there's nothing to
-        // do on the render thread (workers keep meshing their queue regardless), so return.
-        if (pending != null) {
-            if (ctx.isAsyncDone(pending.op)) {
-                finalizePending(ctx);
-            } else {
-                return;
-            }
-        }
-
         RtFrameStats.TERRAIN.begin();
         int pbx = mc.player.getBlockX();
         int pby = mc.player.getBlockY();
@@ -353,84 +373,136 @@ public final class RtTerrain {
         int loY = minSecY;
         int hiY = maxSecY;
 
-        List<SectionGeom> removed = this.removed;
-        removed.clear();
-        List<PreparedSection> prepared = this.prepared;
-        prepared.clear();
-
-        boolean movedWindow = windowValid && (windowPcx != pcx || windowPcz != pcz);
+        // Evicted geometry lands in `removed` and is consumed by the next streaming pass's build kick.
         try (RtFrameStats.Scope ignored = RtFrameStats.TERRAIN.stage("windowSync")) {
             syncDesiredWindow(chunkSource, pcx, psy, pcz, r, loY, hiY, removed);
         }
 
         // Re-extract edited sections. Drain under a short lock so concurrent block updates are not lost.
-        drainDirty();
-        if (!dirtyDrain.isEmpty()) {
-            for (LongIterator it = dirtyDrain.iterator(); it.hasNext(); ) {
-                long key = it.nextLong();
-                handleDirtySection(key, pcx, psy, pcz, NO_DIRTY_GROUP);
-            }
-        }
-        if (!dirtyEventDrain.isEmpty()) {
-            for (DirtyEvent event : dirtyEventDrain) {
-                handleDirtyEvent(event, pcx, psy, pcz);
-            }
-        }
-
-        // Tessellate + upload new sections (BLAS build deferred to rebuild's single batched submission).
-        try (RtFrameStats.Scope ignored = RtFrameStats.TERRAIN.stage("snapshotDispatch")) {
-            DispatchContext dispatch = null;
-            int dispatchCap = movedWindow ? asyncDispatchMovingPerTick() : asyncDispatchPerTick();
-            int dispatchSlots = Math.min(dispatchCap, Math.max(0, maxInflight() - inFlight.size()));
-            if (dispatchSlots > 0 && !playerReextract.isEmpty()) {
-                dispatch = dispatchContext(level);
-                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots,
-                        playerReextract, queuedPlayerReextract, PRIORITY_PLAYER);
-            }
-            if (dispatchSlots > 0 && !reextract.isEmpty()) {
-                if (dispatch == null) {
-                    dispatch = dispatchContext(level);
+        try (RtFrameStats.Scope ignored = RtFrameStats.TERRAIN.stage("dirtyDrain")) {
+            drainDirty();
+            if (!dirtyDrain.isEmpty()) {
+                for (LongIterator it = dirtyDrain.iterator(); it.hasNext(); ) {
+                    long key = it.nextLong();
+                    handleDirtySection(key, pcx, psy, pcz, NO_DIRTY_GROUP);
                 }
-                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots,
-                        reextract, queuedReextract, PRIORITY_DIRTY);
             }
-            if (dispatchSlots > 0 && !missing.isEmpty()) {
-                if (dispatch == null) {
-                    dispatch = dispatchContext(level);
+            if (!dirtyEventDrain.isEmpty()) {
+                for (DirtyEvent event : dirtyEventDrain) {
+                    handleDirtyEvent(event, pcx, psy, pcz);
                 }
-                dispatchTessellation(dispatch, chunkSource, dispatchSlots);
-            }
-        }
-
-        int resultCap = movedWindow ? sectionResultsMovingPerTick() : sectionResultsPerTick();
-        try (RtFrameStats.Scope ignored = RtFrameStats.TERRAIN.stage("drainUpload")) {
-            drainTessellation(ctx, prepared, removed, resultCap);
-        }
-
-        if (!removed.isEmpty() || !prepared.isEmpty()) {
-            try (RtFrameStats.Scope ignored = RtFrameStats.TERRAIN.stage("startBuild")) {
-                startBuild(ctx, prepared, removed, pbx, pby, pbz);
             }
         }
         RtFrameStats.TERRAIN.end();
+
+        // Dispatch/drain/build normally runs per render frame (RtComposite → frame()). If no frame has
+        // streamed recently — loading screen, no world rendering — drive it from here with the bigger
+        // fallback budget so the world still fills.
+        if (System.nanoTime() - lastFrameStreamNanos > STREAM_FALLBACK_AFTER_NANOS) {
+            stream(ctx, streamFallbackBudgetNanos());
+        }
+    }
+
+    /** The per-render-frame entry point: run one budgeted streaming pass. */
+    private void frameStream(RtContext ctx) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null) {
+            return;
+        }
+        lastFrameStreamNanos = System.nanoTime();
+        processDeferredFrees();
+        stream(ctx, dynamicStreamBudgetNanos());
+    }
+
+    /**
+     * One streaming pass: finalize a completed async BLAS build, dispatch section snapshots to the worker
+     * pool, drain finished tessellations into GPU uploads, and kick the next batched build — stopping
+     * dispatch/drain once {@code budgetNanos} of wall clock is spent. Skips silently when there is
+     * nothing to do (no stats row).
+     */
+    private void stream(RtContext ctx, long budgetNanos) {
+        Minecraft mc = Minecraft.getInstance();
+        ClientLevel level = mc.level;
+        if (level == null || mc.player == null) {
+            return;
+        }
+        boolean buildDone = pending != null && ctx.isAsyncDone(pending.op);
+        if (pending != null && !buildDone) {
+            return; // one GPU build in flight at a time; workers keep meshing their queue meanwhile
+        }
+        if (!buildDone && playerReextract.isEmpty() && reextract.isEmpty() && missing.isEmpty()
+                && completedPlayerJobs.isEmpty() && completedDirtyJobs.isEmpty() && completedMissingJobs.isEmpty()
+                && removed.isEmpty() && prepared.isEmpty()) {
+            return;
+        }
+        RtFrameStats.STREAM.begin();
+        if (buildDone) {
+            try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("finalize")) {
+                finalizePending(ctx);
+            }
+        }
+        long deadline = System.nanoTime() + budgetNanos;
+        int pbx = mc.player.getBlockX();
+        int pby = mc.player.getBlockY();
+        int pbz = mc.player.getBlockZ();
+        int pcx = pbx >> 4, pcz = pbz >> 4, psy = pby >> 4;
+        ClientChunkCache chunkSource = level.getChunkSource();
+
+        // Drain finished tessellations FIRST — uploads are the visible fill progress, so they get budget
+        // priority over new snapshots (dispatch was starving them when snapshots ate the whole slice).
+        try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("drainUpload")) {
+            drainTessellation(ctx, prepared, removed, sectionResultsPerTick(), deadline);
+        }
+
+        // Tessellate new sections with the remaining budget (BLAS build deferred to the batched
+        // submission below).
+        try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("snapshotDispatch")) {
+            DispatchContext dispatch = null;
+            int dispatchSlots = Math.min(asyncDispatchPerTick(), Math.max(0, maxInflight() - inFlight.size()));
+            if (dispatchSlots > 0 && !playerReextract.isEmpty() && System.nanoTime() < deadline) {
+                dispatch = dispatchContext(level);
+                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots, deadline,
+                        playerReextract, queuedPlayerReextract, PRIORITY_PLAYER);
+            }
+            if (dispatchSlots > 0 && !reextract.isEmpty() && System.nanoTime() < deadline) {
+                if (dispatch == null) {
+                    dispatch = dispatchContext(level);
+                }
+                dispatchSlots -= dispatchReextract(dispatch, chunkSource, dispatchSlots, deadline,
+                        reextract, queuedReextract, PRIORITY_DIRTY);
+            }
+            if (dispatchSlots > 0 && !missing.isEmpty() && System.nanoTime() < deadline) {
+                if (dispatch == null) {
+                    dispatch = dispatchContext(level);
+                }
+                dispatchTessellation(dispatch, chunkSource, dispatchSlots, deadline, pcx, psy, pcz);
+            }
+        }
+
+        if (!removed.isEmpty() || !prepared.isEmpty()) {
+            try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("startBuild")) {
+                startBuild(ctx, prepared, removed, pbx, pby, pbz);
+                removed.clear();
+                prepared.clear();
+            }
+        }
+        RtFrameStats.STREAM.end();
     }
 
     private void syncDesiredWindow(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
                                    int radius, int loY, int hiY, List<SectionGeom> removed) {
-        boolean priorityYChanged = windowValid && windowPsy != psy;
-        if (!windowValid || windowPcx != pcx || windowPcz != pcz
-                || windowRadius != radius || windowLoY != loY || windowHiY != hiY) {
-            rebuildDesiredWindow(chunkSource, pcx, psy, pcz, radius, loY, hiY, removed);
+        if (!windowValid || windowRadius != radius || windowLoY != loY || windowHiY != hiY
+                || Math.abs(pcx - windowPcx) > radius || Math.abs(pcz - windowPcz) > radius) {
+            // First window, a shape change, or a jump past any overlap (teleport) — build from scratch.
+            rebuildDesiredWindow(chunkSource, pcx, pcz, radius, loY, hiY, removed);
+        } else if (windowPcx != pcx || windowPcz != pcz) {
+            slideDesiredWindow(chunkSource, pcx, pcz, radius, loY, hiY, removed);
         } else {
-            pollLoadedColumns(chunkSource, pcx, psy, pcz, loY, hiY, removed);
-            if (priorityYChanged) {
-                sortMissing(pcx, psy, pcz);
-                windowPsy = psy;
-            }
+            pollLoadedColumns(chunkSource, loY, hiY, removed);
         }
     }
 
-    private void rebuildDesiredWindow(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
+    private void rebuildDesiredWindow(ClientChunkCache chunkSource, int pcx, int pcz,
                                       int radius, int loY, int hiY, List<SectionGeom> removed) {
         desired.clear();
         desiredColumns.clear();
@@ -454,19 +526,59 @@ public final class RtTerrain {
         pruneUndesired(removed);
         removeKeysNotIn(queuedReextract, desired);
         removeKeysNotIn(queuedPlayerReextract, desired);
-        sortMissing(pcx, psy, pcz);
         windowValid = true;
         windowPcx = pcx;
-        windowPsy = psy;
         windowPcz = pcz;
         windowRadius = radius;
         windowLoY = loY;
         windowHiY = hiY;
     }
 
-    private void pollLoadedColumns(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
-                                   int loY, int hiY, List<SectionGeom> removed) {
-        boolean addedMissing = false;
+    /**
+     * Slide the desired window after a section-boundary crossing: touch only the columns entering and
+     * leaving the (2r+1)² rect instead of rebuilding it (the rebuild — ~100k hash inserts + a full
+     * resident prune + a queue sort at r=32 — was a 10–30 ms hitch every 16 blocks of flight).
+     */
+    private void slideDesiredWindow(ClientChunkCache chunkSource, int pcx, int pcz,
+                                    int radius, int loY, int hiY, List<SectionGeom> removed) {
+        int newMinX = pcx - radius, newMaxX = pcx + radius;
+        int newMinZ = pcz - radius, newMaxZ = pcz + radius;
+        for (int scx = windowPcx - radius; scx <= windowPcx + radius; scx++) {
+            boolean xOutside = scx < newMinX || scx > newMaxX;
+            for (int scz = windowPcz - radius; scz <= windowPcz + radius; scz++) {
+                if (!xOutside && scz >= newMinZ && scz <= newMaxZ) {
+                    continue; // still in the window
+                }
+                long column = columnKey(scx, scz);
+                desiredColumns.remove(column);
+                // Only loaded columns ever had desired sections / queued work (see addDesiredColumnSections
+                // call sites) — nothing to remove for a never-loaded column.
+                if (loadedColumns.remove(column)) {
+                    removeDesiredColumnSections(scx, scz, loY, hiY, removed);
+                }
+            }
+        }
+        int oldMinX = windowPcx - radius, oldMaxX = windowPcx + radius;
+        int oldMinZ = windowPcz - radius, oldMaxZ = windowPcz + radius;
+        for (int scx = newMinX; scx <= newMaxX; scx++) {
+            boolean xOutside = scx < oldMinX || scx > oldMaxX;
+            for (int scz = newMinZ; scz <= newMaxZ; scz++) {
+                if (!xOutside && scz >= oldMinZ && scz <= oldMaxZ) {
+                    continue;
+                }
+                long column = columnKey(scx, scz);
+                desiredColumns.add(column);
+                if (chunkSource.hasChunk(scx, scz)) {
+                    loadedColumns.add(column);
+                    addDesiredColumnSections(scx, scz, loY, hiY);
+                }
+            }
+        }
+        windowPcx = pcx;
+        windowPcz = pcz;
+    }
+
+    private void pollLoadedColumns(ClientChunkCache chunkSource, int loY, int hiY, List<SectionGeom> removed) {
         for (LongIterator it = desiredColumns.iterator(); it.hasNext(); ) {
             long column = it.nextLong();
             int scx = columnX(column);
@@ -478,25 +590,20 @@ public final class RtTerrain {
             }
             if (loaded) {
                 loadedColumns.add(column);
-                addedMissing |= addDesiredColumnSections(scx, scz, loY, hiY);
+                addDesiredColumnSections(scx, scz, loY, hiY);
             } else {
                 loadedColumns.remove(column);
                 removeDesiredColumnSections(scx, scz, loY, hiY, removed);
             }
         }
-        if (addedMissing) {
-            sortMissing(pcx, psy, pcz);
-        }
     }
 
-    private boolean addDesiredColumnSections(int scx, int scz, int loY, int hiY) {
-        boolean addedMissing = false;
+    private void addDesiredColumnSections(int scx, int scz, int loY, int hiY) {
         for (int scy = loY; scy <= hiY; scy++) {
             long key = sectionKey(scx, scy, scz);
             desired.add(key);
-            addedMissing |= enqueueMissingIfNeeded(key);
+            enqueueMissingIfNeeded(key);
         }
-        return addedMissing;
     }
 
     private void removeDesiredColumnSections(int scx, int scz, int loY, int hiY, List<SectionGeom> removed) {
@@ -615,16 +722,13 @@ public final class RtTerrain {
         if (resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
             return false;
         }
-        if (!queuedMissing.add(key)) {
-            int existing = missing.indexOf(key);
-            if (existing < 0) {
-                return false;
-            }
-            missing.removeLong(existing);
+        // `missing` is unsorted — urgency is just the priority lane, read when dispatch selects the best
+        // candidates. Already-queued keys only get their priority/group upgraded.
+        if (queuedMissing.add(key)) {
+            missing.add(key);
         }
         setQueuedGroup(key, dirtyGroup);
         missingPriority.put(key, priority);
-        missing.add(0, key);
         return true;
     }
 
@@ -692,12 +796,6 @@ public final class RtTerrain {
         }
     }
 
-    private void sortMissing(int pcx, int psy, int pcz) {
-        if (missing.size() > 1) {
-            missing.sort((a, b) -> Integer.compare(dist2(a, pcx, psy, pcz), dist2(b, pcx, psy, pcz)));
-        }
-    }
-
     /**
      * Whether a section may be built now: all eight of its horizontal neighbour chunks are loaded. We
      * extract using vanilla's model/fluid renderers, which read across chunk borders for cull faces and
@@ -755,10 +853,29 @@ public final class RtTerrain {
         }
     }
 
-    private static int dist2(long key, int pcx, int psy, int pcz) {
-        int dx = sectionX(key) - pcx, dy = sectionY(key) - psy, dz = sectionZ(key) - pcz;
-        return dx * dx + dy * dy + dz * dz;
+    /**
+     * Reusable per-worker-thread meshing state. The mesh + captures are reset between jobs so their
+     * backing arrays amortize across sections instead of re-growing per job (the per-job allocate-and-grow
+     * ladder was a profiler hotspot during fill). Everything the job result carries out —
+     * {@link PackedSection}, OMM data — is copied out of this state before the job returns, so reuse on
+     * the next job cannot corrupt a queued result. The renderers stay per-job: they're cheap and capture
+     * the dispatch context's model sets/colors.
+     */
+    private static final class WorkerTessState {
+        final QuadCapture capture = new QuadCapture();
+        final FluidCapture fluidCapture = new FluidCapture();
+        final SectionMesh mesh = new SectionMesh();
+        final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+
+        void reset(BlockColors blockColors) {
+            capture.blockColors = blockColors;
+            capture.discardBlock(); // defensive: a prior job's throw could leave buffered quads
+            fluidCapture.reset();
+            mesh.reset();
+        }
     }
+
+    private static final ThreadLocal<WorkerTessState> WORKER_TESS = ThreadLocal.withInitial(WorkerTessState::new);
 
     /**
      * Tessellate one section to a section-local CPU mesh and precompute pure-CPU sidecar data such as
@@ -770,8 +887,8 @@ public final class RtTerrain {
     private static CpuSection buildCpuSection(RenderSectionRegion region, BlockStateModelSet modelSet,
                                               ModelBlockRenderer renderer, QuadCapture capture,
                                               FluidRenderer fluidRenderer, FluidCapture fluidCapture,
-                                              BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
-        SectionMesh mesh = tessellate(region, modelSet, renderer, capture, fluidRenderer, fluidCapture, m, scx, scy, scz);
+                                              SectionMesh mesh, BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
+        tessellate(region, modelSet, renderer, capture, fluidRenderer, fluidCapture, mesh, m, scx, scy, scz);
         if (mesh.isEmpty()) {
             return new CpuSection(null, null);
         }
@@ -832,12 +949,11 @@ public final class RtTerrain {
         return new PackedSection(positions, indices, uvs, material, materialSprites, bucketTris, triBase);
     }
 
-    private static SectionMesh tessellate(RenderSectionRegion region, BlockStateModelSet modelSet,
-                                          ModelBlockRenderer renderer, QuadCapture capture,
-                                          FluidRenderer fluidRenderer, FluidCapture fluidCapture,
-                                          BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
+    private static void tessellate(RenderSectionRegion region, BlockStateModelSet modelSet,
+                                   ModelBlockRenderer renderer, QuadCapture capture,
+                                   FluidRenderer fluidRenderer, FluidCapture fluidCapture,
+                                   SectionMesh mesh, BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
         int sox = scx << 4, soy = scy << 4, soz = scz << 4;
-        SectionMesh mesh = new SectionMesh();
         capture.cur = mesh;
         capture.view = region;
         fluidCapture.cur = mesh;
@@ -885,7 +1001,6 @@ public final class RtTerrain {
                 }
             }
         }
-        return mesh;
     }
 
     /** Surface the first per-block/fluid meshing throw (swallowed above to keep one bad block from voiding
@@ -905,7 +1020,7 @@ public final class RtTerrain {
      */
     private PreparedSection uploadSection(RtContext ctx, PackedSection packed, RtAccel.OpacityMicromapInput ommInput,
                                           long key, int sox, int soy, int soz) {
-        RtFrameStats.TERRAIN.count("sectionsUploaded", 1);
+        RtFrameStats.STREAM.count("sectionsUploaded", 1);
         int vertCount = packed.positions().length / 3;
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -959,39 +1074,113 @@ public final class RtTerrain {
                 mc.getBlockColors());
     }
 
-    private void dispatchTessellation(DispatchContext dispatch, ClientChunkCache chunkSource, int budget) {
+    /**
+     * Dispatch the best missing sections. {@code missing} is <b>unsorted</b>; every call makes one
+     * compacting pass over it (dropping entries whose {@code queuedMissing} membership was cleared
+     * elsewhere) while collecting the top candidates by (priority, column-distance², |Δy|) into a bounded
+     * max-heap — nearest-first order continuously tracks the player with no sort anywhere (the old
+     * sorted-queue approach re-sorted the whole list on every window rebuild, a multi-ms spike at high
+     * render distance). Ranking by <b>column</b> first makes the dispatch order column-coherent: all
+     * sections of a column share the same 3×3 chunk neighbourhood, and the pass-scoped
+     * {@link RenderRegionCache} dedupes {@code SectionCopy}s, so after a column's first snapshot the rest
+     * are nearly free.
+     */
+    private void dispatchTessellation(DispatchContext dispatch, ClientChunkCache chunkSource, int budget, long deadline,
+                                      int pcx, int psy, int pcz) {
         if (missing.isEmpty() || budget <= 0) {
             return;
         }
-        int attempts = Math.min(missing.size(), Math.max(64, budget * 4));
-        for (int i = 0; i < missing.size() && budget > 0 && attempts-- > 0; ) {
-            long key = missing.getLong(i);
+        // Over-collect 2x the budget so candidates skipped for unready neighbour chunks (they cluster at
+        // the window edge) don't leave dispatch slots idle.
+        int k = Math.min(missing.size(), Math.max(8, budget * 2));
+        long[] heapRank = new long[k];
+        long[] heapKey = new long[k];
+        int heapSize = 0;
+        int write = 0;
+        for (int read = 0, n = missing.size(); read < n; read++) {
+            long key = missing.getLong(read);
             if (!queuedMissing.contains(key)) {
+                // Dequeued (dispatched / built / left the window) since it was added — compact out.
                 missingPriority.remove(key);
                 if (!isQueuedAnywhere(key)) {
                     clearQueuedGroup(key, true);
                 }
-                missing.removeLong(i);
                 continue;
             }
+            missing.set(write++, key);
+            // rank = priority(48+) | columnDist²(16..47) | |Δy|(0..15): column-major nearest-first.
+            int dx = sectionX(key) - pcx;
+            int dz = sectionZ(key) - pcz;
+            long colDist2 = (long) dx * dx + (long) dz * dz;
+            long dy = Math.min(0xFFFF, Math.abs(sectionY(key) - psy));
+            long rank = ((long) missingPriority.get(key) << 48) | (colDist2 << 16) | dy;
+            if (heapSize < k) {
+                heapRank[heapSize] = rank;
+                heapKey[heapSize] = key;
+                siftUp(heapRank, heapKey, heapSize++);
+            } else if (rank < heapRank[0]) {
+                heapRank[0] = rank;
+                heapKey[0] = key;
+                siftDown(heapRank, heapKey, heapSize, 0);
+            }
+        }
+        missing.size(write);
+        // Heapsort the candidates ascending (best first), then dispatch until the budget/deadline runs out.
+        for (int end = heapSize - 1; end > 0; end--) {
+            long r = heapRank[0]; heapRank[0] = heapRank[end]; heapRank[end] = r;
+            long q = heapKey[0]; heapKey[0] = heapKey[end]; heapKey[end] = q;
+            siftDown(heapRank, heapKey, end, 0);
+        }
+        for (int i = 0; i < heapSize && budget > 0 && System.nanoTime() < deadline; i++) {
+            long key = heapKey[i];
             if (!desired.contains(key) || resident.containsKey(key) || empty.contains(key) || inFlight.containsKey(key)) {
                 queuedMissing.remove(key);
                 missingPriority.remove(key);
                 clearQueuedGroup(key, true);
-                missing.removeLong(i);
-                continue;
+                continue; // stale list entry — compacted out on a later pass
             }
             int sx = sectionX(key);
             int sz = sectionZ(key);
             if (!neighborChunksReady(chunkSource, sx, sz)) {
-                i++;
-                continue;
+                continue; // stays queued; dispatched once the neighbours load
             }
             int priority = missingPriority.remove(key);
             queuedMissing.remove(key);
-            missing.removeLong(i);
             budget--;
             dispatchSection(dispatch, key, sx, sectionY(key), sz, priority);
+        }
+    }
+
+    /** Max-heap sift-up on parallel (rank, key) arrays — worst candidate at the root. */
+    private static void siftUp(long[] rank, long[] key, int i) {
+        while (i > 0) {
+            int parent = (i - 1) >> 1;
+            if (rank[parent] >= rank[i]) {
+                return;
+            }
+            long r = rank[parent]; rank[parent] = rank[i]; rank[i] = r;
+            long q = key[parent]; key[parent] = key[i]; key[i] = q;
+            i = parent;
+        }
+    }
+
+    private static void siftDown(long[] rank, long[] key, int size, int i) {
+        while (true) {
+            int left = 2 * i + 1;
+            int right = left + 1;
+            int big = i;
+            if (left < size && rank[left] > rank[big]) {
+                big = left;
+            }
+            if (right < size && rank[right] > rank[big]) {
+                big = right;
+            }
+            if (big == i) {
+                return;
+            }
+            long r = rank[big]; rank[big] = rank[i]; rank[i] = r;
+            long q = key[big]; key[big] = key[i]; key[i] = q;
+            i = big;
         }
     }
 
@@ -1001,14 +1190,14 @@ public final class RtTerrain {
      * with a gap — when the new mesh is built (see {@link #startBuild} retiring the replaced geom). This
      * is what prevents the visible flicker on block updates that plain eviction would cause.
      */
-    private int dispatchReextract(DispatchContext dispatch, ClientChunkCache chunkSource, int budget,
+    private int dispatchReextract(DispatchContext dispatch, ClientChunkCache chunkSource, int budget, long deadline,
                                   LongArrayList queue, LongOpenHashSet queued, int priority) {
         if (queue.isEmpty()) {
             return 0;
         }
         int dispatched = 0;
         int attempts = Math.min(queue.size(), Math.max(64, budget * 4));
-        for (int i = 0; i < queue.size() && budget > 0 && attempts-- > 0; ) {
+        for (int i = 0; i < queue.size() && budget > 0 && attempts-- > 0 && System.nanoTime() < deadline; ) {
             long key = queue.getLong(i);
             if (!queued.contains(key)) {
                 if (!isQueuedAnywhere(key)) {
@@ -1042,7 +1231,7 @@ public final class RtTerrain {
 
     /** Snapshot one section on the render thread and submit its tessellation to the worker pool. */
     private void dispatchSection(DispatchContext dispatch, long key, int sx, int sy, int sz, int priority) {
-        RtFrameStats.TERRAIN.count("sectionsSnapshotted", 1);
+        RtFrameStats.STREAM.count("sectionsSnapshotted", 1);
         RenderSectionRegion region = dispatch.regionCache().createRegion(dispatch.level(), SectionPos.asLong(sx, sy, sz));
         long token = ++tessToken;
         long dirtyGroup = queuedDirtyGroup.remove(key);
@@ -1052,13 +1241,12 @@ public final class RtTerrain {
         TessJob job = new TessJob(key, token, sx << 4, sy << 4, sz << 4, priority, dirtyGroup);
         Future<?> future = RtWorkerPool.INSTANCE.submit(() -> {
             try {
+                WorkerTessState ws = WORKER_TESS.get(); // thread-confined; reset per job, arrays amortized
+                ws.reset(dispatch.blockColors());
                 ModelBlockRenderer renderer = new ModelBlockRenderer(false, true, dispatch.blockColors());
-                QuadCapture capture = new QuadCapture();
-                capture.blockColors = dispatch.blockColors();
                 FluidRenderer fluidRenderer = new FluidRenderer(dispatch.fluidModelSet());
-                FluidCapture fluidCapture = new FluidCapture();
-                BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-                CpuSection cpu = buildCpuSection(region, dispatch.modelSet(), renderer, capture, fluidRenderer, fluidCapture, m, sx, sy, sz);
+                CpuSection cpu = buildCpuSection(region, dispatch.modelSet(), renderer, ws.capture,
+                        fluidRenderer, ws.fluidCapture, ws.mesh, ws.pos, sx, sy, sz);
                 enqueueCompleted(job, cpu, null);
             } catch (Throwable t) {
                 enqueueCompleted(job, null, t);
@@ -1118,10 +1306,18 @@ public final class RtTerrain {
      * render thread. A job whose token no longer matches {@link #inFlight} is stale — its section was
      * re-dirtied / unloaded / left the window since dispatch — and is dropped without uploading.
      */
-    private void drainTessellation(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed, int resultCap) {
+    private void drainTessellation(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed,
+                                   int resultCap, long deadline) {
         int budget = resultCap;
         int attempts = resultCap * 4;
+        boolean first = true;
         while (budget > 0 && attempts-- > 0) {
+            // Always take at least one result so uploads make progress even when dispatch ate the whole
+            // budget (inFlight backpressure then shifts the budget to draining on the next frames).
+            if (!first && System.nanoTime() >= deadline) {
+                break;
+            }
+            first = false;
             TessResult result = pollCompleted();
             if (result == null) {
                 break;
@@ -1368,9 +1564,15 @@ public final class RtTerrain {
         }
 
         for (PreparedSection ps : prepared) {
-            SectionGeom prev = resident.get(ps.key());
             SectionGeom g = new SectionGeom(ps.key(), ps.positions(), ps.indices(), ps.uvs(), ps.material(),
                     ps.blas().accel, ps.blas().pooledBacking(), ps.triBase(), ps.sx(), ps.sy(), ps.sz());
+            if (!desired.contains(ps.key())) {
+                // Left the window while its batched BLAS build was in flight (window sync keeps running
+                // during builds). Never published — retire the fresh, unreferenced geometry.
+                retire(freeAt, null, List.of(g));
+                continue;
+            }
+            SectionGeom prev = resident.get(ps.key());
             if (prev != null && prev.slot >= 0) {
                 g.slot = prev.slot;
                 g.instanceIndex = prev.instanceIndex;
@@ -1400,6 +1602,21 @@ public final class RtTerrain {
             staticInstanceList.clear();
             staticInstances = null;
             published.clear();
+            // The instance list + slot registry were just reset, but evicted geometry can still be waiting
+            // in the `removed` accumulator (window sync runs while a build is in flight — e.g. a respawn
+            // evicts everything at once) or in a dirty group's removed list. Their instanceIndex/slot point
+            // into the cleared lists; neutralize them so the eventual removePublishedSection is a no-op
+            // (their buffers are still retired normally when the accumulator is consumed).
+            for (SectionGeom g : this.removed) {
+                g.instanceIndex = -1;
+                g.slot = -1;
+            }
+            for (DirtyGroup group : dirtyGroups.values()) {
+                for (SectionGeom g : group.removed) {
+                    g.instanceIndex = -1;
+                    g.slot = -1;
+                }
+            }
             ready = false;
             return;
         }
@@ -1577,7 +1794,8 @@ public final class RtTerrain {
         reextract.clear();
         queuedReextract.clear();
         windowValid = false;
-        if (pending == null && resident.isEmpty() && sectionTable == null && deferred.isEmpty()) {
+        if (pending == null && resident.isEmpty() && sectionTable == null && deferred.isEmpty()
+                && removed.isEmpty() && prepared.isEmpty()) {
             empty.clear();
             staticInstances = null;
             published.clear();
@@ -1627,7 +1845,15 @@ public final class RtTerrain {
         empty.clear();
         staticInstances = null;
         published.clear();
+        // The accumulators can hold evicted-but-not-yet-retired geometry (window sync fills `removed`
+        // between streaming passes) and uploaded-but-unbuilt sections; the GPU is idle here, free them.
+        for (SectionGeom g : removed) {
+            g.destroy(pool);
+        }
         removed.clear();
+        for (PreparedSection ps : prepared) {
+            destroyPreparedSection(ps);
+        }
         prepared.clear();
         if (destroyPool) {
             pool.destroyAll();
@@ -1768,6 +1994,20 @@ public final class RtTerrain {
                     && (translucent == null || translucent.idx.isEmpty())
                     && (water == null || water.idx.isEmpty());
         }
+
+        /** Empty the buckets keeping their backing arrays — the mesh is reused across jobs per worker thread. */
+        void reset() {
+            resetGeom(opaque);
+            resetGeom(cutout);
+            resetGeom(translucent);
+            resetGeom(water);
+        }
+
+        private static void resetGeom(Geom geom) {
+            if (geom != null) {
+                geom.reset();
+            }
+        }
     }
 
     /** One geometry bucket's packed, section-local mesh data. */
@@ -1799,6 +2039,15 @@ public final class RtTerrain {
         int triCount() {
             return idx.size() / 3;
         }
+
+        void reset() {
+            verts.clear();       // fastutil clear() keeps the backing array
+            idx.clear();
+            cornerUv.clear();
+            prim.clear();
+            materialSprites.clear();
+            ommSprites.clear();
+        }
     }
 
     /** Minimal growable sprite array for the worker path; avoids ArrayList object churn and per-copy gets. */
@@ -1829,6 +2078,11 @@ public final class RtTerrain {
 
         void copyInto(TextureAtlasSprite[] dst, int offset) {
             System.arraycopy(elements, 0, dst, offset, size);
+        }
+
+        void clear() {
+            java.util.Arrays.fill(elements, 0, size, null); // don't retain sprites across atlas reloads
+            size = 0;
         }
     }
 
@@ -2120,6 +2374,11 @@ public final class RtTerrain {
         private int n;
         private final float[] qx = new float[4], qy = new float[4], qz = new float[4], qu = new float[4], qv = new float[4];
         private final int[] qc = new int[4]; // per-vertex packed ARGB (vanilla bakes the biome water tint here)
+
+        /** Reset per-job assembly state (a mid-quad meshing throw could leave a partial quad buffered). */
+        void reset() {
+            n = 0;
+        }
 
         @Override
         public VertexConsumer getBuilder(ChunkSectionLayer layer) {

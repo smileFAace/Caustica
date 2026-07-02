@@ -485,12 +485,18 @@ public final class UpscalerConfig {
                     intAtLeast("upscaler.rt.asyncDispatchPerTick", 64, 0);
             public static final IntSetting SECTION_RESULTS_PER_TICK =
                     intAtLeast("upscaler.rt.sectionResultsPerTick", 64, 0);
-            public static final IntSetting ASYNC_DISPATCH_MOVING_PER_TICK =
-                    intAtLeast("upscaler.rt.asyncDispatchMovingPerTick",
-                            Math.min(ASYNC_DISPATCH_PER_TICK.value(), 24), 0);
-            public static final IntSetting SECTION_RESULTS_MOVING_PER_TICK =
-                    intAtLeast("upscaler.rt.sectionResultsMovingPerTick",
-                            Math.min(SECTION_RESULTS_PER_TICK.value(), 24), 0);
+            // Wall-clock budget for one streaming pass (snapshot dispatch + upload drain). The per-frame
+            // slice scales with queue pressure from STREAM_BUDGET_MS (near-idle) up to STREAM_BUDGET_MAX_MS
+            // (big backlog: initial fill, F3+A, teleport, fast flight) so fill throughput recovers when it
+            // matters and the cost drops back once the queue clears. STREAM_FALLBACK_BUDGET_MS is the
+            // per-tick slice used only when no world frame is streaming (loading screens), where a long
+            // pass hitches nothing.
+            public static final FloatSetting STREAM_BUDGET_MS =
+                    clampedFloat("upscaler.rt.streamBudgetMs", 1.5f, 0.05f, 100f);
+            public static final FloatSetting STREAM_BUDGET_MAX_MS =
+                    clampedFloat("upscaler.rt.streamBudgetMaxMs", 6f, 0.05f, 100f);
+            public static final FloatSetting STREAM_FALLBACK_BUDGET_MS =
+                    clampedFloat("upscaler.rt.streamFallbackBudgetMs", 8f, 0.05f, 100f);
             public static final IntSetting MAX_INFLIGHT_SECTIONS =
                     intAtLeast("upscaler.rt.maxInflightSections", 192, 0);
             public static final IntSetting SECTION_TABLE_INITIAL_CAPACITY =

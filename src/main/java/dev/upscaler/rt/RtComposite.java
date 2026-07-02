@@ -297,6 +297,18 @@ public final class RtComposite {
         return this.failed;
     }
 
+    /**
+     * Clear the failure latch on an explicit render-state invalidation (F3+A, dimension change) so RT
+     * re-arms after a transient error instead of staying on vanilla until restart. A deterministic
+     * failure just latches again on the next frame (bounded log spam: one error line per invalidation).
+     */
+    public void resetFailureLatch() {
+        if (failed) {
+            failed = false;
+            UpscalerMod.LOGGER.info("RT failure latch cleared by render-state invalidation; retrying RT");
+        }
+    }
+
     /** Capture the frame's camera for the next composite. Called from GameRendererMixin. */
     public void captureFrame(Matrix4f projection, Matrix4fc viewRotation, double cameraX, double cameraY, double cameraZ) {
         frameProjection.set(projection);
@@ -331,6 +343,15 @@ public final class RtComposite {
             return false;
         }
         processDeferredTlasFrees(); // free per-frame TLASes now safely past their frames-in-flight window
+        // Budgeted terrain streaming (dispatch/drain/build kick) runs here, once per render frame — before
+        // the ready gate below, because it is what MAKES terrain ready during the initial fill.
+        try {
+            RtTerrain.frame(ctx);
+        } catch (Throwable t) {
+            failed = true;
+            UpscalerMod.LOGGER.error("RT terrain streaming failed; reverting to vanilla/upscaler path", t);
+            return false;
+        }
         if (RtTerrain.currentOrNull() == null || !frameCaptured || Minecraft.getInstance().level == null) {
             // No world this frame (incl. after quitting to the title — terrain residency + frameCaptured can
             // linger until an explicit invalidate, which would otherwise present a stale/empty HDR image as a

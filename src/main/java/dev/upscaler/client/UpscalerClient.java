@@ -60,7 +60,10 @@ public final class UpscalerClient implements ClientModInitializer {
 		// setLevel, render-distance change, F3+A) — drop RT terrain residency so it rebuilds for the new
 		// world. Fixes stale geometry persisting across an End→Overworld switch (coords alone aren't
 		// world-unique). Resource reloads do NOT fire this; that path is handled separately.
-		InvalidateRenderStateCallback.EVENT.register(RtTerrain::requestFullClear);
+		InvalidateRenderStateCallback.EVENT.register(() -> {
+			RtTerrain.requestFullClear();
+			RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
+		});
 
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
 			shutdownRt();

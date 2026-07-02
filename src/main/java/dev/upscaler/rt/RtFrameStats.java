@@ -25,7 +25,12 @@ public final class RtFrameStats {
     private static final double HITCH_MULTIPLIER = 1.5;
 
     public static final Profile TERRAIN = new Profile("terrain-tick",
-            new String[] {"windowSync", "snapshotDispatch", "drainUpload", "startBuild"},
+            new String[] {"windowSync", "dirtyDrain"},
+            new String[] {});
+    // One row per streaming pass (dispatch + drain + build kick), whichever loop drove it: the per-render-
+    // frame call from RtComposite or the tick fallback. Idle passes (nothing to do) write no row.
+    public static final Profile STREAM = new Profile("terrain-stream",
+            new String[] {"finalize", "snapshotDispatch", "drainUpload", "startBuild"},
             new String[] {"sectionsSnapshotted", "sectionsUploaded"});
     public static final Profile COMPOSITE = new Profile("composite",
             new String[] {"entityCapture", "beCapture", "particles", "blasRecord", "prepareTlas", "traceRecord"},
