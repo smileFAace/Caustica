@@ -361,7 +361,6 @@ public final class RtTerrain {
             }
         }
 
-        RtFrameStats.TERRAIN.begin();
         int pbx = mc.player.getBlockX();
         int pby = mc.player.getBlockY();
         int pbz = mc.player.getBlockZ();
@@ -374,12 +373,12 @@ public final class RtTerrain {
         int hiY = maxSecY;
 
         // Evicted geometry lands in `removed` and is consumed by the next streaming pass's build kick.
-        try (RtFrameStats.Scope ignored = RtFrameStats.TERRAIN.stage("windowSync")) {
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.windowSync")) {
             syncDesiredWindow(chunkSource, pcx, psy, pcz, r, loY, hiY, removed);
         }
 
         // Re-extract edited sections. Drain under a short lock so concurrent block updates are not lost.
-        try (RtFrameStats.Scope ignored = RtFrameStats.TERRAIN.stage("dirtyDrain")) {
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.dirtyDrain")) {
             drainDirty();
             if (!dirtyDrain.isEmpty()) {
                 for (LongIterator it = dirtyDrain.iterator(); it.hasNext(); ) {
@@ -393,8 +392,6 @@ public final class RtTerrain {
                 }
             }
         }
-        RtFrameStats.TERRAIN.end();
-
         // Dispatch/drain/build normally runs per render frame (RtComposite → frame()). If no frame has
         // streamed recently — loading screen, no world rendering — drive it from here with the bigger
         // fallback budget so the world still fills.
@@ -435,9 +432,8 @@ public final class RtTerrain {
                 && removed.isEmpty() && prepared.isEmpty()) {
             return;
         }
-        RtFrameStats.STREAM.begin();
         if (buildDone) {
-            try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("finalize")) {
+            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.finalize")) {
                 finalizePending(ctx);
             }
         }
@@ -450,13 +446,13 @@ public final class RtTerrain {
 
         // Drain finished tessellations FIRST — uploads are the visible fill progress, so they get budget
         // priority over new snapshots (dispatch was starving them when snapshots ate the whole slice).
-        try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("drainUpload")) {
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.drainUpload")) {
             drainTessellation(ctx, prepared, removed, sectionResultsPerTick(), deadline);
         }
 
         // Tessellate new sections with the remaining budget (BLAS build deferred to the batched
         // submission below).
-        try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("snapshotDispatch")) {
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.snapshotDispatch")) {
             DispatchContext dispatch = null;
             int dispatchSlots = Math.min(asyncDispatchPerTick(), Math.max(0, maxInflight() - inFlight.size()));
             if (dispatchSlots > 0 && !playerReextract.isEmpty() && System.nanoTime() < deadline) {
@@ -480,13 +476,12 @@ public final class RtTerrain {
         }
 
         if (!removed.isEmpty() || !prepared.isEmpty()) {
-            try (RtFrameStats.Scope ignored = RtFrameStats.STREAM.stage("startBuild")) {
+            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("terrain.startBuild")) {
                 startBuild(ctx, prepared, removed, pbx, pby, pbz);
                 removed.clear();
                 prepared.clear();
             }
         }
-        RtFrameStats.STREAM.end();
     }
 
     private void syncDesiredWindow(ClientChunkCache chunkSource, int pcx, int psy, int pcz,
@@ -1020,7 +1015,7 @@ public final class RtTerrain {
      */
     private PreparedSection uploadSection(RtContext ctx, PackedSection packed, RtAccel.OpacityMicromapInput ommInput,
                                           long key, int sox, int soy, int soz) {
-        RtFrameStats.STREAM.count("sectionsUploaded", 1);
+        RtFrameStats.FRAME.count("sectionsUploaded", 1);
         int vertCount = packed.positions().length / 3;
         int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
@@ -1231,7 +1226,7 @@ public final class RtTerrain {
 
     /** Snapshot one section on the render thread and submit its tessellation to the worker pool. */
     private void dispatchSection(DispatchContext dispatch, long key, int sx, int sy, int sz, int priority) {
-        RtFrameStats.STREAM.count("sectionsSnapshotted", 1);
+        RtFrameStats.FRAME.count("sectionsSnapshotted", 1);
         RenderSectionRegion region = dispatch.regionCache().createRegion(dispatch.level(), SectionPos.asLong(sx, sy, sz));
         long token = ++tessToken;
         long dirtyGroup = queuedDirtyGroup.remove(key);

@@ -183,7 +183,7 @@ public final class RtEntities {
 
     // Recycle per-frame entity mesh buffers + BLAS backing/scratch instead of alloc/free churning
     // ~6 VMA buffers per entity per frame. See RtBufferPool.
-    private final RtBufferPool pool = new RtBufferPool(() -> RtFrameStats.COMPOSITE.count("vmaBufferCreates", 1));
+    private final RtBufferPool pool = new RtBufferPool(() -> RtFrameStats.FRAME.count("vmaBufferCreates", 1));
     private final FrameLists[] frameLists = new FrameLists[FRAME_LIST_RING];
 
     // Previous frame's captured (rebase-space) vertex positions + that frame's rebase origin, keyed by
@@ -392,13 +392,13 @@ public final class RtEntities {
         setCamera(camX, camY, camZ, projection, viewRotation);
 
         FrameBuild build = new FrameBuild(base);
-        try (RtFrameStats.Scope ignored = RtFrameStats.COMPOSITE.stage("entityCapture")) {
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.capture")) {
             captureEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
         }
-        try (RtFrameStats.Scope ignored = RtFrameStats.COMPOSITE.stage("beCapture")) {
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blockEntities")) {
             captureBlockEntities(ctx, build, mc, level, partial, rbx, rby, rbz);
         }
-        try (RtFrameStats.Scope ignored = RtFrameStats.COMPOSITE.stage("particles")) {
+        try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.particles")) {
             captureParticles(ctx, build, mc, partial, rbx, rby, rbz, projection, viewRotation);
         }
         evictStaleAccels();
@@ -467,7 +467,7 @@ public final class RtEntities {
             if (!appendRigidReuse(ctx, build, motion, id, mask)) {
                 appendCapture(ctx, build, motion, id, ENTITY_BIT, mask);
             }
-            RtFrameStats.COMPOSITE.count("entitiesCaptured", 1);
+            RtFrameStats.FRAME.count("entitiesCaptured", 1);
         }
         Map<Integer, EntityPrev> oldPrev = prevVerts;
         prevVerts = curVerts;
@@ -954,7 +954,7 @@ public final class RtEntities {
         build.instances.add(new RtAccel.Instance(xform, ea.refAccel.deviceAddress,
                 ENTITY_BIT | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
         build.count++;
-        RtFrameStats.COMPOSITE.count("entityReuse", 1);
+        RtFrameStats.FRAME.count("entityReuse", 1);
         return true;
     }
 
@@ -1192,7 +1192,7 @@ public final class RtEntities {
                 && slot.vertCount == vertCount && slot.triCount == triCount
                 && slot.updatesSinceBuild < refitRebuildInterval();
         if (canUpdate) {
-            RtFrameStats.COMPOSITE.count("refits", 1);
+            RtFrameStats.FRAME.count("refits", 1);
             RtBuffer scratch = pool.acquire(ctx, slot.updateScratchSize, storage, false, label + " refit scratch");
             build.blas.add(RtAccel.refitUpdate(slot.accel, scratch, positions.deviceAddress, indices.deviceAddress, vertCount, idxCount, false,
                     label + " BLAS refit"));

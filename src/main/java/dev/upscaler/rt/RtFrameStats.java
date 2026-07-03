@@ -15,31 +15,44 @@ import java.util.List;
 import net.fabricmc.loader.api.FabricLoader;
 
 /**
- * Opt-in per-stage timing and hitch detection for the terrain-tick and composite-frame hot loops.
- * Gated by {@code -Dupscaler.rt.frameStats}; every method is a cheap branch when disabled. {@link #TERRAIN}
- * and {@link #COMPOSITE} are independent {@link Profile}s since the two loops run on different cadences
- * (the client tick vs. once per render frame). Every completed frame is appended as one row to
- * {@code <gameDir>/rt-frame-stats/<name>.csv} (fresh file per session), and a profile additionally logs one
- * line whenever a frame's total exceeds {@value #HITCH_MULTIPLIER}x its own rolling median, with that
- * frame's per-stage/counter breakdown.
+ * Opt-in render-frame timing and hitch detection. Gated by {@code -Dupscaler.rt.frameStats}; every method
+ * is a cheap branch when disabled. The profile begins when RT client-tick work starts (or at
+ * {@code GameRenderer.render} HEAD when there was no RT tick work) and ends at render TAIL, so the hitch
+ * decision uses one frame envelope rather than one action/pass at a time. Every completed frame is appended
+ * as one row to {@code <gameDir>/rt-frame-stats/frame.csv} (fresh file per session), and a log line is
+ * emitted only when the frame exceeds {@value #HITCH_MULTIPLIER}x its rolling median. That hitch line
+ * includes all detailed stage timings and counters recorded during the frame.
  */
 public final class RtFrameStats {
     private static final int MEDIAN_WINDOW = 64;
     private static final double HITCH_MULTIPLIER = 1.5;
 
-    public static final Profile TERRAIN = new Profile("terrain-tick",
-            new String[] {"windowSync", "dirtyDrain"},
-            new String[] {});
-    // One row per streaming pass (dispatch + drain + build kick), whichever loop drove it: the per-render-
-    // frame call from RtComposite or the tick fallback. Idle passes (nothing to do) write no row.
-    public static final Profile STREAM = new Profile("terrain-stream",
-            new String[] {"finalize", "snapshotDispatch", "drainUpload", "startBuild"},
-            new String[] {"sectionsSnapshotted", "sectionsUploaded"});
-    // trackGc: the composite profile also logs per-frame GC deltas (collection count + reported pause ms)
-    // so hitches with no stage attribution can be pinned on (or cleared of) garbage collection.
-    public static final Profile COMPOSITE = new Profile("composite",
-            new String[] {"entityCapture", "beCapture", "particles", "blasRecord", "prepareTlas", "traceRecord"},
-            new String[] {"entitiesCaptured", "refits", "entityReuse", "vmaBufferCreates"}, true);
+    // trackGc: per-frame GC deltas (collection count + reported pause ms) help distinguish JVM pauses from
+    // uninstrumented render work when a hitch's unaccounted time is large.
+    public static final Profile FRAME = new Profile("frame",
+            new String[] {
+                    "terrain.windowSync",
+                    "terrain.dirtyDrain",
+                    "terrain.finalize",
+                    "terrain.drainUpload",
+                    "terrain.snapshotDispatch",
+                    "terrain.startBuild",
+                    "entity.capture",
+                    "entity.blockEntities",
+                    "entity.particles",
+                    "entity.blasRecord",
+                    "frame.prepareTlas",
+                    "frame.recordTlas",
+                    "frame.trace",
+                    "frame.exposure",
+                    "frame.dlssRr",
+                    "frame.upscale",
+                    "frame.displayMap",
+                    "frame.copyOutput"
+            },
+            new String[] {"sectionsSnapshotted", "sectionsUploaded", "entitiesCaptured", "refits",
+                    "entityReuse", "vmaBufferCreates"},
+            true);
 
     private static final List<GarbageCollectorMXBean> GC_BEANS = ManagementFactory.getGarbageCollectorMXBeans();
 
@@ -79,7 +92,7 @@ public final class RtFrameStats {
         void close();
     }
 
-    /** A timed loop: per-stage nanos + named counters for the frame in progress, plus a rolling-median hitch log. */
+    /** A timed render frame: per-stage nanos + named counters, plus a rolling-median hitch log. */
     public static final class Profile {
         private final String name;
         private final String[] stageNames;
@@ -96,6 +109,7 @@ public final class RtFrameStats {
         private long gcMsStart;
         private PrintWriter csv;
         private boolean csvOpenAttempted;
+        private boolean active;
 
         private Profile(String name, String[] stageNames, String[] counterNames) {
             this(name, stageNames, counterNames, false);
@@ -112,9 +126,11 @@ public final class RtFrameStats {
 
         /** Start timing a new frame; clears this frame's stage/counter accumulators. */
         public void begin() {
+            active = false;
             if (!enabled()) {
                 return;
             }
+            active = true;
             frameStart = System.nanoTime();
             Arrays.fill(stageNanos, 0L);
             Arrays.fill(counters, 0L);
@@ -124,9 +140,16 @@ public final class RtFrameStats {
             }
         }
 
+        /** Start a frame only when one is not already collecting RT tick details for this render. */
+        public void beginIfInactive() {
+            if (!active) {
+                begin();
+            }
+        }
+
         /** Time one named stage of the current frame; close the returned scope when the stage completes. */
         public Scope stage(String stageName) {
-            if (!enabled()) {
+            if (!enabled() || !active) {
                 return Scope.NOOP;
             }
             int idx = indexOf(stageNames, stageName);
@@ -136,7 +159,7 @@ public final class RtFrameStats {
 
         /** Add to a named counter for the current frame. */
         public void count(String counterName, int delta) {
-            if (!enabled() || delta == 0) {
+            if (!enabled() || !active || delta == 0) {
                 return;
             }
             counters[indexOf(counterNames, counterName)] += delta;
@@ -144,6 +167,10 @@ public final class RtFrameStats {
 
         /** Finish the current frame: record it into the rolling median and log a hitch line if it's slow. */
         public void end() {
+            if (!active) {
+                return;
+            }
+            active = false;
             if (!enabled()) {
                 return;
             }

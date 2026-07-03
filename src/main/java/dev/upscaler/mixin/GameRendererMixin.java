@@ -58,6 +58,11 @@ public abstract class GameRendererMixin {
 		}
 	}
 
+	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V", at = @At("TAIL"))
+	private void upscaler$endRtFrameStats(DeltaTracker deltaTracker, boolean advanceGameTime, CallbackInfo ci) {
+		RtComposite.INSTANCE.endFrame();
+	}
+
 	@Inject(method = "render(Lnet/minecraft/client/DeltaTracker;Z)V",
 			at = @At(value = "INVOKE",
 					target = "Lnet/minecraft/client/renderer/GameRenderer;renderLevel(Lnet/minecraft/client/DeltaTracker;)V"))

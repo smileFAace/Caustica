@@ -633,7 +633,7 @@ public final class UpscalerConfig {
             }
         }
 
-        /** Per-stage terrain-tick/composite-frame timing + hitch logging. See {@code RtFrameStats}. */
+        /** Render-frame timing + hitch logging. See {@code RtFrameStats}. */
         public static final class FrameStats {
             public static final BooleanSetting ENABLED = bool("upscaler.rt.frameStats", false);
 

@@ -326,7 +326,12 @@ public final class RtComposite {
      * runs instead.
      */
     public void beginFrame() {
+        RtFrameStats.FRAME.beginIfInactive();
         hdrWrittenThisFrame = false;
+    }
+
+    public void endFrame() {
+        RtFrameStats.FRAME.end();
     }
 
     public boolean composite(GpuTexture nativeColor, int width, int height) {
@@ -672,7 +677,6 @@ public final class RtComposite {
     }
 
     private void recordFrame(RtContext ctx, RtPipeline active, GpuTexture nativeColor) {
-        RtFrameStats.COMPOSITE.begin();
         long dstImage = vkImage(nativeColor);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).upscaler$getBackend();
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
@@ -770,27 +774,30 @@ public final class RtComposite {
             // terrain BLAS), then the trace — each separated by a barrier. The frame TLAS is retired
             // KEEP_FRAMES later (entity meshes/BLAS are retired by RtEntities on the same horizon).
             if (!fe.blas().isEmpty()) {
-                try (RtFrameStats.Scope ignored = RtFrameStats.COMPOSITE.stage("blasRecord")) {
+                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
                     RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
                 }
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
             }
             RtAccel.PreparedTlas frameTlas;
-            try (RtFrameStats.Scope ignored = RtFrameStats.COMPOSITE.stage("prepareTlas")) {
+            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
                 frameTlas = RtAccel.prepareTlas(ctx, fe.instances(), tlasRing);
             }
             active.setTlas(frameTlas.accel.handle);
-            RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
+            try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
+                RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
+            }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
 
             // Push only the 8-byte device address of this frame's filled push-data slot.
             ByteBuffer pushAddr = stack.malloc(Long.BYTES).putLong(0, pushBuf.deviceAddress);
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world trace");
-                 RtFrameStats.Scope ignoredStats = RtFrameStats.COMPOSITE.stage("traceRecord")) {
+                 RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.trace")) {
                 active.trace(cmd, renderW, renderH, pushAddr);
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT color visible to exposure histogram/fixed write
-            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure")) {
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure");
+                 RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.exposure")) {
                 exposure.record(ctx, cmd, stack, output);
             }
             // DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
@@ -800,7 +807,8 @@ public final class RtComposite {
                 // DLSS expects the reported jitter to be the NEGATION of what was added to the
                 // primary ray (pixelCenter += jitter), matching the mcvr reference (apply +J, report
                 // -J). The shader push above uses +jitter; report -jitter here.
-                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "DLSS-RR evaluate")) {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "DLSS-RR evaluate");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.dlssRr")) {
                     rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
                             gSpecAlbedo, gNormal, gSpecMotion, rrOutput, renderW, renderH, displayW, displayH,
                             -jitterX, -jitterY, frameViewRotation, frameProjection);
@@ -812,20 +820,23 @@ public final class RtComposite {
             // always has a display-res RT image. With RR off render == display, so this is a 1:1 copy.
             if (!rrDone) {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack);
-                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "fallback upscale")) {
+                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "fallback upscale");
+                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.upscale")) {
                     blitUpscale(cmd, stack, output, rrOutput);
                 }
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
-            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "map RT to display")) {
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "map RT to display");
+                 RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
                 displayPipeline.dispatch(cmd, displayW, displayH, UpscalerConfig.Rt.Hdr.enabled(),
                         UpscalerConfig.Rt.Hdr.paperWhiteNits(), UpscalerConfig.Rt.Hdr.headroom());
             }
             hdrWrittenThisFrame = UpscalerConfig.Rt.Hdr.enabled();
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
 
-            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target")) {
+            try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target");
+                 RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.copyOutput")) {
                 VK10.vkCmdCopyImage(cmd, displayImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                         dstImage, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, displayW, displayH));
             }
@@ -835,7 +846,6 @@ public final class RtComposite {
             throw new IllegalStateException("vkEndCommandBuffer(rt composite) failed");
         }
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
-        RtFrameStats.COMPOSITE.end();
     }
 
     /**

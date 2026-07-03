@@ -4,6 +4,7 @@ import dev.upscaler.UpscalerMod;
 import dev.upscaler.rt.RtContext;
 import dev.upscaler.rt.RtDeviceBringup;
 import dev.upscaler.rt.RtComposite;
+import dev.upscaler.rt.RtFrameStats;
 import dev.upscaler.rt.entity.RtEntities;
 import dev.upscaler.rt.terrain.RtTerrain;
 import dev.upscaler.rt.terrain.RtWorkerPool;
@@ -42,6 +43,7 @@ public final class UpscalerClient implements ClientModInitializer {
 			if (rtInitDone) {
 				RtContext ctx = RtContext.currentOrNull();
 				if (ctx != null) {
+					RtFrameStats.FRAME.beginIfInactive();
 					// Bring the world pipeline + LabPBR atlases up before terrain tessellates, so per-prim
 					// material flags resolve from the first section (PBR on join, no re-extract). No-op
 					// until we're in a world with the block atlas loaded, or once already created.
