@@ -854,7 +854,14 @@ public final class RtAccel {
      * result: the ring owns the resources.
      */
     public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> instances, TlasRing ring) {
-        int count = instances.size();
+        return prepareTlas(ctx, instances, List.of(), ring);
+    }
+
+    /** Pack terrain and dynamic instances as two contiguous ranges without a composite-list get per item. */
+    public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> baseInstances,
+                                           List<Instance> dynamicInstances, TlasRing ring) {
+        int baseCount = baseInstances.size();
+        int count = Math.addExact(baseCount, dynamicInstances.size());
         TlasRing.Slot slot = ring.slots[ring.cursor];
         if (slot == null || count > slot.capacity) {
             // Outgrown (or first use). The slot's previous use is RING frames behind — off all queues by
@@ -867,25 +874,31 @@ public final class RtAccel {
         }
         ring.cursor = (ring.cursor + 1) % TlasRing.RING;
 
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Reuse a single record + transform buffer across all instances: allocating per-instance
-            // on the MemoryStack (64 KB/thread) overflows it once there are hundreds of sections.
-            VkAccelerationStructureInstanceKHR rec = VkAccelerationStructureInstanceKHR.calloc(stack);
-            java.nio.FloatBuffer xform = stack.mallocFloat(12);
-            for (int i = 0; i < count; i++) {
-                Instance inst = instances.get(i);
-                xform.clear();
-                xform.put(inst.transform3x4()).flip();
-                rec.transform().matrix(xform);
-                rec.instanceCustomIndex(inst.customIndex()).mask(inst.mask()).instanceShaderBindingTableRecordOffset(inst.sbtRecordOffset())
-                        .flags(0x00000001) // VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
-                        .accelerationStructureReference(inst.blasDeviceAddress());
-                MemoryUtil.memCopy(rec.address(), slot.instanceBuffer.mapped + (long) i * VkAccelerationStructureInstanceKHR.SIZEOF,
-                        VkAccelerationStructureInstanceKHR.SIZEOF);
-            }
+        writeTlasInstances(baseInstances, slot.instanceBuffer.mapped, 0);
+        writeTlasInstances(dynamicInstances, slot.instanceBuffer.mapped, baseCount);
+        if (count > 0) {
+            slot.instanceBuffer.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
         }
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
                 "frame TLAS " + count + " instances");
+    }
+
+    // Pack directly into the mapped Vulkan array to keep this per-instance TLAS hot path allocation-free.
+    private static void writeTlasInstances(List<Instance> instances, long mapped, int firstInstance) {
+        final int facingCullDisable = 0x00000001;
+        for (int i = 0, count = instances.size(); i < count; i++) {
+            Instance instance = instances.get(i);
+            long dst = mapped + (long) (firstInstance + i) * VkAccelerationStructureInstanceKHR.SIZEOF;
+            float[] transform = instance.transform3x4();
+            for (int component = 0; component < 12; component++) {
+                MemoryUtil.memPutFloat(dst + (long) component * Float.BYTES, transform[component]);
+            }
+            MemoryUtil.memPutInt(dst + 48L,
+                    (instance.customIndex() & 0x00FF_FFFF) | ((instance.mask() & 0xFF) << 24));
+            MemoryUtil.memPutInt(dst + 52L,
+                    (instance.sbtRecordOffset() & 0x00FF_FFFF) | (facingCullDisable << 24));
+            MemoryUtil.memPutLong(dst + 56L, instance.blasDeviceAddress());
+        }
     }
 
     /** Create one ring slot sized for {@code capacity} instances (instance buffer + AS + backing + scratch). */

@@ -42,7 +42,6 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
-import java.util.AbstractList;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -342,9 +341,9 @@ public final class RtEntities {
         long retryYawFitAfter;
     }
 
-    /** This frame's entity contribution: the full instance list (terrain + entities), the entity BLAS to
-     *  build inline this frame, and the geometry-table device address the hit shader reads. */
-    public record FrameEntities(List<RtAccel.Instance> instances, List<RtAccel.PreparedBlas> blas, long geomTableAddr) {
+    /** This frame's terrain and dynamic instance segments, entity BLAS builds, and geometry-table address. */
+    public record FrameEntities(List<RtAccel.Instance> baseInstances, List<RtAccel.Instance> dynamicInstances,
+                                List<RtAccel.PreparedBlas> blas, long geomTableAddr) {
     }
 
     /** One glowing entity's body mesh (rebased-space positions, copied out of {@link #capture} before the
@@ -496,51 +495,17 @@ public final class RtEntities {
         return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
     };
 
-    /** Read-only base terrain instances plus this frame's appended dynamic instances. */
-    private static final class FrameInstanceList extends AbstractList<RtAccel.Instance> {
-        private List<RtAccel.Instance> base = List.of();
-        private final ArrayList<RtAccel.Instance> dynamic = new ArrayList<>(entityListCapacity());
-
-        void reset(List<RtAccel.Instance> base) {
-            this.base = base;
-            dynamic.clear();
-        }
-
-        void release() {
-            base = List.of();
-            dynamic.clear();
-        }
-
-        @Override
-        public RtAccel.Instance get(int index) {
-            int baseSize = base.size();
-            return index < baseSize ? base.get(index) : dynamic.get(index - baseSize);
-        }
-
-        @Override
-        public int size() {
-            return base.size() + dynamic.size();
-        }
-
-        @Override
-        public boolean add(RtAccel.Instance instance) {
-            dynamic.add(instance);
-            modCount++;
-            return true;
-        }
-    }
-
     /** Reused per-frame lists; one slot is retired before it can be selected again. */
     private static final class FrameLists {
-        final FrameInstanceList instances = new FrameInstanceList();
+        final ArrayList<RtAccel.Instance> instances = new ArrayList<>(entityListCapacity());
         final ArrayList<RtAccel.PreparedBlas> blas = new ArrayList<>(entityListCapacity());
         final ArrayList<RtAccel.PreparedBlas> pooledBlas = new ArrayList<>(entityListCapacity());
         final ArrayList<RtBuffer> refitScratch = new ArrayList<>(entityListCapacity());
         final ArrayList<RtBuffer> buffers = new ArrayList<>(TRANSIENT_BUFFER_LIST_CAPACITY);
         final MotionArena motion = new MotionArena();
 
-        void reset(List<RtAccel.Instance> base) {
-            instances.reset(base);
+        void reset() {
+            instances.clear();
             blas.clear();
             pooledBlas.clear();
             refitScratch.clear();
@@ -558,7 +523,7 @@ public final class RtEntities {
             for (RtBuffer buf : buffers) {
                 buf.destroy();
             }
-            instances.release();
+            instances.clear();
             blas.clear();
             pooledBlas.clear();
             refitScratch.clear();
@@ -605,12 +570,12 @@ public final class RtEntities {
                                     double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
         processDeferred();
         if (!enabled()) {
-            return new FrameEntities(base, List.of(), 0L);
+            return new FrameEntities(base, List.of(), List.of(), 0L);
         }
         Minecraft mc = Minecraft.getInstance();
         ClientLevel level = mc.level;
         if (level == null) {
-            return new FrameEntities(base, List.of(), 0L);
+            return new FrameEntities(base, List.of(), List.of(), 0L);
         }
         float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
         setCamera(camX, camY, camZ, projection, viewRotation);
@@ -638,7 +603,7 @@ public final class RtEntities {
         RtFrameStats.FRAME.count("entityRetainedGeometryBytes", retainedGeometryBytes);
 
         if (build.instances == null) {
-            return new FrameEntities(base, List.of(), 0L);
+            return new FrameEntities(base, List.of(), List.of(), 0L);
         }
         // Retire this frame's transient meshes + scratch + pooled-BUILD BLAS once it is no longer in flight
         // (their build + the trace that reads them must complete first). Refit AS persist in entityAccels.
@@ -648,7 +613,7 @@ public final class RtEntities {
             // The deferred horizon guarantees these are off all queues, so destroying them now is safe.
             listsForFree.releaseDeferred();
         }));
-        return new FrameEntities(build.instances, build.blas, build.geomTableAddr);
+        return new FrameEntities(base, build.instances, build.blas, build.geomTableAddr);
     }
 
     /** Capture animated entities (mobs, items, falling blocks) with per-object motion-vector displacement. */
@@ -1291,7 +1256,7 @@ public final class RtEntities {
             return;
         }
         FrameLists lists = frameLists[(int) (RtComposite.frameCounter() % frameLists.length)];
-        lists.reset(build.base);
+        lists.reset();
         build.lists = lists;
         build.instances = lists.instances;
         build.blas = lists.blas;

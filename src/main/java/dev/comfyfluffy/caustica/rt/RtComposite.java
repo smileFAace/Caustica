@@ -873,7 +873,7 @@ public final class RtComposite {
             }
             RtAccel.PreparedTlas frameTlas;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
-                frameTlas = RtAccel.prepareTlas(ctx, fe.instances(), tlasRing);
+                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing);
             }
             active.setTlas(frameTlas.accel.handle);
             currentTlasHandle = frameTlas.accel.handle;
