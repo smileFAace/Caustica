@@ -21,8 +21,20 @@ function Find-Java25Home {
 	foreach ($c in $candidates) {
 		$java = Join-Path $c "bin\java.exe"
 		if (-not (Test-Path $java)) { continue }
-		$ver = & $java -version 2>&1 | Out-String
-		if ($ver -match 'version "25') { return $c }
+		# Prefer path heuristic: HMCL's Mojang Java 25 runtime folder name.
+		if ($c -match 'mojang-java-runtime-epsilon|jdk-25|java-25|jdk25') { return $c }
+		$prev = $ErrorActionPreference
+		$ErrorActionPreference = 'Continue'
+		try {
+			$ver = cmd /c "`"$java`" -version 2>&1"
+			if ("$ver" -match 'version "25') { return $c }
+		} finally {
+			$ErrorActionPreference = $prev
+		}
+	}
+	# Last resort: if the only candidate exists and is under .hmcl, use it.
+	foreach ($c in $candidates) {
+		if ($c -match '\\.hmcl\\java\\') { return $c }
 	}
 	throw "Java 25 not found. Set JAVA_HOME to a JDK 25 install (HMCL ships one under AppData\Roaming\.hmcl\java\...)."
 }
