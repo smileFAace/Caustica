@@ -56,8 +56,22 @@ public struct WorldPush {
     // z = tintStrength (0 = ignore per-prim emission tint, 1 = full),
     // w = reserved.
     public float4   emissionParams;
+    // Explicit local area lights (block emitters). Positions are terrain-rebase space (same as
+    // hit positions before camOffset). radiance is pre-tint * level01; shader multiplies strength.
+    public uint64_t localLightsAddr;
+    public uint     localLightCount;
+    public uint     localLightSamples; // NEE samples per path vertex
+    public float    localLightRange;   // soft falloff distance (blocks)
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
+};
+
+// One area light triangle for local NEE. 64 B std430 (4 x float4).
+public struct LocalLight {
+    public float4 p0;       // xyz position (terrain-rebase), w unused
+    public float4 p1;
+    public float4 p2;
+    public float4 radiance; // xyz radiance proxy (level * tint), w = area
 };
 
 // Radiance-ray payload (location 0). Member order and types are a cross-stage ABI.

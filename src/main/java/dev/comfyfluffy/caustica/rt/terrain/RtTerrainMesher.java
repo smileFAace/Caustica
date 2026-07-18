@@ -113,6 +113,7 @@ final class RtTerrainMesher {
     }
 
     private static PackedSection packSection(SectionMesh mesh) {
+        float[] localLights = mesh.packLocalLights();
         Geom[] buckets = mesh.buckets(); // { solid, cutout, translucent, water }, indexed by RtAccel.BUCKET_*
         int vertFloats = 0, idxCount = 0, uvFloats = 0, primFloats = 0, triCount = 0;
         int[] bucketTris = new int[buckets.length];
@@ -157,7 +158,7 @@ final class RtTerrainMesher {
             vertBase += vertSize / 3;
             triAcc += bucketTris[b];
         }
-        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase);
+        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase, localLights);
     }
 
     private static void tessellate(BlockAndTintGetter region, BlockStateModelSet modelSet,
@@ -217,7 +218,7 @@ final class RtTerrainMesher {
 
     /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
-                         int[] bucketTris, int[] triBase) {
+                         int[] bucketTris, int[] triBase, float[] localLights) {
     }
 
 
@@ -235,6 +236,8 @@ final class RtTerrainMesher {
         private static final int CUTOUT_TRI_CAP = 256;
         private static final int TRANSLUCENT_TRI_CAP = 64;
         private static final int WATER_TRI_CAP = 128;
+        /** Cap lights extracted per section (mesh-time); frame path culls further. */
+        private static final int MAX_SECTION_LIGHTS = 64;
         // One bucket per fixed RtAccel terrain geometry: solid, cutout, translucent, water.
         private static final Geom EMPTY_GEOM = new Geom(0);
         Geom opaque;
@@ -242,6 +245,8 @@ final class RtTerrainMesher {
         Geom translucent;
         Geom water;
         private final Geom[] buckets = new Geom[RtAccel.TERRAIN_BUCKETS];
+        /** Host-side area lights: 16 floats each (p0,p1,p2,radiance+area), section-local. */
+        private final FloatArrayList localLights = new FloatArrayList(16 * 8);
 
         Geom[] buckets() {
             buckets[RtAccel.BUCKET_SOLID] = geomOrEmpty(opaque);
@@ -288,11 +293,63 @@ final class RtTerrainMesher {
             resetGeom(cutout);
             resetGeom(translucent);
             resetGeom(water);
+            localLights.clear();
         }
 
         private static void resetGeom(Geom geom) {
             if (geom != null) {
                 geom.reset();
+            }
+        }
+
+        float[] packLocalLights() {
+            if (localLights.isEmpty()) {
+                return null;
+            }
+            return localLights.toFloatArray();
+        }
+
+        /** Record one emissive triangle as an explicit NEE area light (section-local positions). */
+        void addLocalLight(float p0x, float p0y, float p0z,
+                           float p1x, float p1y, float p1z,
+                           float p2x, float p2y, float p2z,
+                           float nx, float ny, float nz,
+                           float emission, int emissionTint) {
+            if (localLights.size() / RtLocalLights.UPLOAD_FLOATS >= MAX_SECTION_LIGHTS) {
+                return;
+            }
+            if (emission <= 1.0e-4f) {
+                return;
+            }
+            // Triangle area via cross product.
+            float e1x = p1x - p0x, e1y = p1y - p0y, e1z = p1z - p0z;
+            float e2x = p2x - p0x, e2y = p2y - p0y, e2z = p2z - p0z;
+            float cx = e1y * e2z - e1z * e2y;
+            float cy = e1z * e2x - e1x * e2z;
+            float cz = e1x * e2y - e1y * e2x;
+            float area = 0.5f * (float) Math.sqrt(cx * cx + cy * cy + cz * cz);
+            if (area <= 1.0e-6f) {
+                return;
+            }
+            // Radiance proxy: emission level * optional color temperature (matches hit-emission scale
+            // before WorldPush strength; shader multiplies strength again for NEE).
+            float tr = 1f, tg = 1f, tb = 1f;
+            if (emissionTint != 0) {
+                tr = ((emissionTint >> 16) & 0xFF) / 255f;
+                tg = ((emissionTint >> 8) & 0xFF) / 255f;
+                tb = (emissionTint & 0xFF) / 255f;
+            }
+            // Bias slightly along normal so shadow rays from receivers don't self-hit the emitter face.
+            float bias = 0.002f;
+            p0x += nx * bias; p0y += ny * bias; p0z += nz * bias;
+            p1x += nx * bias; p1y += ny * bias; p1z += nz * bias;
+            p2x += nx * bias; p2y += ny * bias; p2z += nz * bias;
+            float[] scratch = new float[RtLocalLights.UPLOAD_FLOATS];
+            RtLocalLights.writeLight(scratch, 0,
+                    p0x, p0y, p0z, p1x, p1y, p1z, p2x, p2y, p2z,
+                    tr * emission, tg * emission, tb * emission, area);
+            for (float v : scratch) {
+                localLights.add(v);
             }
         }
     }
@@ -613,6 +670,15 @@ final class RtTerrainMesher {
                 prim.add(0f); // aux1
                 g.ommSprites.add(q.sprite);
             }
+            // Explicit area lights for local NEE (one triangle of the quad is enough; second is coplanar).
+            if (q.emission > 1.0e-4f) {
+                cur.addLocalLight(
+                        q.x[0], q.y[0], q.z[0],
+                        q.x[1], q.y[1], q.z[1],
+                        q.x[2], q.y[2], q.z[2],
+                        q.nx, q.ny, q.nz,
+                        q.emission, q.emissionTint);
+            }
         }
     }
 
@@ -763,6 +829,10 @@ final class RtTerrainMesher {
                 prim.add(Float.intBitsToFloat(emissionTint)); // aux0 emission color temperature
                 prim.add(0f);
                 g.ommSprites.add(null);
+            }
+            if (!water && emission > 1.0e-4f) {
+                cur.addLocalLight(qx[0], qy[0], qz[0], qx[1], qy[1], qz[1], qx[2], qy[2], qz[2],
+                        nx, ny, nz, emission, emissionTint);
             }
         }
 

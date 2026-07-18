@@ -422,6 +422,90 @@ float3 visibility(float3 origin, float3 dir, float tmax) {
     return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
 }
 
+// --- Local block-light NEE (simplified LightInfo path) ---------------------------------------------
+// Uniform pick among worldPush.localLightCount area lights; sample a point on the triangle; soft range
+// falloff; one shadow ray. No full ReSTIR — variance drops vs hit-only emission for nearby torches.
+
+float3 sampleLocalLightNEE(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough,
+                           bool pbr, inout uint seed) {
+    uint lightCount = worldPush.localLightCount;
+    if (lightCount == 0u || worldPush.localLightsAddr == 0ull) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    ConstPtr<LocalLight> lights = ConstPtr<LocalLight>(worldPush.localLightsAddr);
+    uint samples = max(worldPush.localLightSamples, 1u);
+    float range = max(worldPush.localLightRange, 1.0);
+    float rangeSq = range * range;
+    float strength = max(worldPush.emissionParams.x, 0.0);
+    float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
+    float3 sum = float3(0.0, 0.0, 0.0);
+
+    for (uint s = 0u; s < samples; s++) {
+        uint li = min(uint(floor(rndf(seed) * float(lightCount))), lightCount - 1u);
+        LocalLight light = lights[li];
+        float area = light.radiance.w;
+        if (area <= 1.0e-8) {
+            continue;
+        }
+        // Uniform barycentric sample on the triangle.
+        float r1 = rndf(seed);
+        float r2 = rndf(seed);
+        float su = 1.0 - sqrt(r1);
+        float sv = r2 * sqrt(r1);
+        float sw = 1.0 - su - sv;
+        float3 lightPos = light.p0.xyz * sw + light.p1.xyz * su + light.p2.xyz * sv;
+        float3 toLight = lightPos - p;
+        float distSq = dot(toLight, toLight);
+        if (distSq < 1.0e-8 || distSq > rangeSq * 4.0) {
+            continue;
+        }
+        float dist = sqrt(distSq);
+        float3 ldir = toLight / dist;
+        float ndl = max(0.0, dot(n, ldir));
+        if (ndl <= 0.0) {
+            continue;
+        }
+        // Light normal from triangle (for one-sided emitters).
+        float3 ln = cross(light.p1.xyz - light.p0.xyz, light.p2.xyz - light.p0.xyz);
+        float lnLen = length(ln);
+        if (lnLen <= 1.0e-8) {
+            continue;
+        }
+        ln /= lnLen;
+        float lightNdl = max(0.0, dot(ln, -ldir)); // receiver must see the front face
+        if (lightNdl <= 0.0) {
+            continue;
+        }
+        float3 vis = visibility(p, ldir, dist - 1.0e-3);
+        if (max(vis.r, max(vis.g, vis.b)) <= 0.0) {
+            continue;
+        }
+        // Soft falloff beyond `range` (still allows a little overshoot from hard cull at 2*range).
+        float atten = saturate(1.0 - dist / range);
+        atten *= atten;
+        // light.radiance.xyz already holds level * tint (0..~1). Apply runtime strength + power curve.
+        float level = pow(saturate(max(light.radiance.x, max(light.radiance.y, light.radiance.z))), levelPower);
+        // Use chromaticity of stored radiance, magnitude from level*strength.
+        float3 tint = light.radiance.xyz / max(max(light.radiance.x, max(light.radiance.y, light.radiance.z)), 1.0e-4);
+        float3 Le = tint * level * strength;
+        // Area-measure sample: pdf = (1/N) * (1/area). Solid-angle factor = cos_light / r².
+        // L += f * Le * cos_surf * cos_light * area * N / r²
+        float3 brdf = diffAlb * INV_PI;
+        if (pbr) {
+            float3 h = normalize(ldir + v);
+            float ndh = max(0.0, dot(n, h));
+            float ndv = max(1.0e-4, dot(n, v));
+            float vdh = max(0.0, dot(v, h));
+            float D = ggxD(ndh, rough);
+            float G = ggxG1(ndv, rough) * ggxG1(ndl, rough);
+            float3 F = fresnelSchlick(vdh, F0);
+            brdf += (D * G) * F / (4.0 * ndv * ndl);
+        }
+        sum += brdf * Le * ndl * lightNdl * area * float(lightCount) / distSq * atten * vis;
+    }
+    return sum / float(samples);
+}
+
 float2 projectPrevNdc(float3 worldPos) {
     float4 clip = mul(worldPush.prevViewProj, float4(worldPos - worldPush.camOffset + worldPush.camDelta, 1.0));
     return clip.xy / clip.w;
@@ -773,14 +857,15 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
             gv_motionObjDisp = payload.motionPrev; // per-vertex world motion (0 for static terrain/sky)
         }
 
-        // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly.
+        // Emissive surfaces (lava, glowstone, torches, ...) add radiance on hit.
         // Color comes from hit albedo (already multiplied by optional per-prim emission tint in rchit).
         // Scale = pow(level01, lightLevelPower) * emissiveStrength from worldPush.emissionParams (runtime).
-        // Block lights have no NEE, so emission is gathered by hitting emitters during the walk (counted
-        // at every vertex, no double counting). Small emitters are noisy, but temporal accumulation
-        // converges static views.
+        // When local-light NEE is active, only count hit emission on the primary bounce so the lamp face
+        // stays bright without double-counting NEE already lighting nearby surfaces. Without NEE, keep
+        // the legacy every-vertex gather (noisy but unbiased for that path).
         float emission = payloadEmission();
-        if (emission > 0.0) {
+        bool localNee = worldPush.localLightCount > 0u;
+        if (emission > 0.0 && (!localNee || bounce == 0)) {
             float strength = max(worldPush.emissionParams.x, 0.0);
             float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
             float level = pow(saturate(emission), levelPower);
@@ -820,6 +905,12 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
                 }
                 L += throughput * brdf * worldPush.lightRadiance.xyz * ndl * vis;
             }
+        }
+
+        // Local block-light NEE (torches, glowstone, lava, ...). Complements hit-emission so lights
+        // illuminate nearby surfaces without requiring the path to strike the emitter.
+        if (worldPush.localLightCount > 0u) {
+            L += throughput * sampleLocalLightNEE(p, n, v, diffAlb, F0, rough, pbr, seed);
         }
 
         // Thin-surface SSS transmission. Light entering from the back face scatters through toward the
@@ -992,6 +1083,14 @@ void main() {
             float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
             float level = pow(saturate(gv_emission), levelPower);
             dbg = saturate(gv_albedo * level * strength * 0.15);
+        } else if (pc.debugView == 12u) {
+            // Motion vector magnitude (brighter = larger screen-space motion this frame).
+            float mag = length(motion) * 0.1;
+            dbg = float3(mag, mag * 0.4, 0.0);
+        } else if (pc.debugView == 13u) {
+            // Local-light buffer occupancy proxy (green when any lights are bound).
+            float c = worldPush.localLightCount > 0u ? saturate(float(worldPush.localLightCount) / 64.0) : 0.0;
+            dbg = float3(0.05, c, 0.15);
         } else {
             dbg = float3(clamp(0.5 + motion * 0.05, 0.0, 1.0), 0.5); // motion: red=+x, green=+y
         }

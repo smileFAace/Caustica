@@ -42,6 +42,7 @@ final class RtSectionBuilder {
         RtBuffer material = null;
         RtBuffer upload = null;
         RtAccel.PreparedBlas blas = null;
+        float[] localLights = packed.localLights();
         try {
             long positionsBytes = (long) packed.positions().length * Float.BYTES;
             long indicesBytes = (long) packed.indices().length * Integer.BYTES;
@@ -71,11 +72,11 @@ final class RtSectionBuilder {
             blas = RtAccel.prepareTerrainBlas(ctx, positions, vertCount, indices,
                     packed.bucketTris(), ommInput, label + " BLAS");
             return new PreparedSection(key, positions, indices, uvs, material, upload, blas,
-                    packed.triBase(), sox, soy, soz);
+                    packed.triBase(), sox, soy, soz, localLights);
         } catch (Throwable t) {
             if (blas != null) {
                 destroy(new PreparedSection(key, positions, indices, uvs, material, upload, blas,
-                        packed.triBase(), sox, soy, soz));
+                        packed.triBase(), sox, soy, soz, localLights));
             } else {
                 if (upload != null) upload.destroy();
                 if (material != null) material.destroy();
@@ -132,7 +133,7 @@ final class RtSectionBuilder {
     /** Worker-owned native section state paired with its prepared BLAS. */
     record PreparedSection(long key, RtBuffer positions, RtBuffer indices, RtBuffer uvs,
                            RtBuffer material, RtBuffer upload, RtAccel.PreparedBlas blas, int[] triBase,
-                           int sx, int sy, int sz) {
+                           int sx, int sy, int sz, float[] localLights) {
         void releaseUpload() {
             upload.destroy();
         }
@@ -144,7 +145,7 @@ final class RtSectionBuilder {
 
         PreparedSection withBlas(RtAccel.PreparedBlas replacement) {
             return new PreparedSection(key, positions, indices, uvs, material, upload, replacement,
-                    triBase, sx, sy, sz);
+                    triBase, sx, sy, sz, localLights);
         }
     }
 }

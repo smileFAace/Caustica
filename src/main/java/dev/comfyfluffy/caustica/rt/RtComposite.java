@@ -62,10 +62,13 @@ import dev.comfyfluffy.caustica.rt.pipeline.RtHdrCompositePipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSdrPresentPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtExposure;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
+import dev.comfyfluffy.caustica.rt.terrain.RtLocalLights;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * On-screen composite. Each frame, ray-trace into a render-res storage image (+ guide buffers), use
@@ -262,6 +265,9 @@ public final class RtComposite {
     private long atlasSampler;
     private boolean failed;
     private boolean loggedActive;
+    /** Scratch list for per-frame local-light gather (reused to avoid alloc). */
+    private final List<RtLocalLights.SectionLights> localLightScratch = new ArrayList<>();
+    private int historyResetHoldFrames;
 
     // Camera captured each frame from GameRenderer (unjittered level projection + camera rotation + pos).
     private final Matrix4f frameProjection = new Matrix4f();
@@ -745,17 +751,39 @@ public final class RtComposite {
             mvCamDeltaX = (float) (camX - mvPrevCamX);
             mvCamDeltaY = (float) (camY - mvPrevCamY);
             mvCamDeltaZ = (float) (camZ - mvPrevCamZ);
+            maybeRequestHistoryReset();
         } else {
             mvPushMatrix.set(mvCurProjView);
             mvCamDeltaX = 0f;
             mvCamDeltaY = 0f;
             mvCamDeltaZ = 0f;
+            RtDlssRr.INSTANCE.requestHistoryReset();
         }
         mvPrevProjView.set(mvCurProjView);
         mvPrevCamX = camX;
         mvPrevCamY = camY;
         mvPrevCamZ = camZ;
         mvHasPrev = true;
+    }
+
+    /**
+     * Camera cuts (teleport / dimension change / huge lag spike) leave RR with invalid history → ghosting.
+     * Thresholds are deliberately coarse so normal mouse look does not thrash history.
+     */
+    private void maybeRequestHistoryReset() {
+        if (historyResetHoldFrames > 0) {
+            historyResetHoldFrames--;
+            RtDlssRr.INSTANCE.requestHistoryReset();
+            return;
+        }
+        double moveSq = (double) mvCamDeltaX * mvCamDeltaX
+                + (double) mvCamDeltaY * mvCamDeltaY
+                + (double) mvCamDeltaZ * mvCamDeltaZ;
+        // ~3 blocks of camera translation in one frame ≈ teleport / respawn / chunk load hitch.
+        if (moveSq > 9.0) {
+            RtDlssRr.INSTANCE.requestHistoryReset();
+            historyResetHoldFrames = 2; // keep reset for a couple of frames while the cut settles
+        }
     }
 
     private void recordFrame(RtContext ctx, RtPipeline active, GpuTexture nativeColor) {
@@ -835,6 +863,10 @@ public final class RtComposite {
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
             SkyPush sky = skyPush();
+            // Gather section-local area lights into one GPU buffer for local NEE.
+            terrain.collectLocalLights(localLightScratch);
+            RtLocalLights.INSTANCE.update(ctx, localLightScratch, camX, camY, camZ,
+                    terrain.blockX, terrain.blockY, terrain.blockZ);
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -863,6 +895,10 @@ public final class RtComposite {
                             CausticaConfig.Rt.Emission.LIGHT_LEVEL_POWER.value(),
                             CausticaConfig.Rt.Emission.TINT_STRENGTH.value(),
                             0f),
+                    RtLocalLights.INSTANCE.bufferAddress(),
+                    RtLocalLights.INSTANCE.count(),
+                    CausticaConfig.Rt.LocalLights.SAMPLES.value(),
+                    CausticaConfig.Rt.LocalLights.RANGE.value(),
                     breaking.length,
                     breaking
             ).write(push);
@@ -1154,6 +1190,7 @@ public final class RtComposite {
         // Teardown runs after the device is idle (CLIENT_STOPPING waits), so the TLAS ring's slots are no
         // longer in flight and can be freed immediately.
         tlasRing.destroy();
+        RtLocalLights.INSTANCE.destroy();
         if (RtDlssRr.enabled()) {
             RtDlssRr.INSTANCE.destroy();
         }

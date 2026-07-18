@@ -41,6 +41,15 @@
 	"caustica.options.rt.blockOutline": "Block Outline",
 	"caustica.options.rt.blockOutline.tooltip": "Draw the looking-at block outline using a ray query against the RT TLAS.",
 
+	"caustica.options.rt.localLights": "Local Light NEE",
+	"caustica.options.rt.localLights.tooltip": "Sample nearby block lights as explicit area lights (torches, glowstone, lava). Improves light reach and reduces firefly noise vs hit-only emission.",
+
+	"caustica.options.rt.localLightSamples": "Local Light Samples",
+	"caustica.options.rt.localLightSamples.tooltip": "NEE samples per path vertex for block lights. Higher is cleaner but costs more shadow rays.",
+
+	"caustica.options.rt.localLightRange": "Local Light Range",
+	"caustica.options.rt.localLightRange.tooltip": "Soft falloff distance in blocks for local light NEE.",
+
 	"caustica.options.rt.waterWaves": "Animated Water",
 	"caustica.options.rt.waterWaves.tooltip": "Animate water-surface normals for moving wave highlights.",
 
@@ -99,5 +108,7 @@
 	"caustica.options.rt.debugView.8": "Emission Mask",
 	"caustica.options.rt.debugView.9": "Emission Source",
 	"caustica.options.rt.debugView.10": "Emission Color",
-	"caustica.options.rt.debugView.11": "Emission Lit"
+	"caustica.options.rt.debugView.11": "Emission Lit",
+	"caustica.options.rt.debugView.12": "Motion Magnitude",
+	"caustica.options.rt.debugView.13": "Local Lights"
 }

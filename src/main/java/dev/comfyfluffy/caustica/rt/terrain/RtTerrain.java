@@ -219,6 +219,16 @@ public final class RtTerrain {
     }
 
     /** Section table device address: {@code {u64 primAddr, u64 uvAddr, u32 triBase[4]}} per section, indexed by gl_InstanceCustomIndexEXT. */
+    /** Host local-light lists for resident sections (section-local positions). */
+    public void collectLocalLights(java.util.List<RtLocalLights.SectionLights> out) {
+        out.clear();
+        for (SectionGeom g : resident.values()) {
+            if (g.localLights != null && g.localLights.length >= RtLocalLights.UPLOAD_FLOATS) {
+                out.add(new RtLocalLights.SectionLights(g.sx, g.sy, g.sz, g.localLights));
+            }
+        }
+    }
+
     public long tableAddress() {
         return table.address();
     }
@@ -1393,7 +1403,7 @@ public final class RtTerrain {
 
         for (PreparedSection ps : prepared) {
             SectionGeom g = new SectionGeom(ps.key(), ps.uvs(), ps.material(),
-                    ps.blas().accel, ps.triBase(), ps.sx(), ps.sy(), ps.sz());
+                    ps.blas().accel, ps.triBase(), ps.sx(), ps.sy(), ps.sz(), ps.localLights());
             if (!desired.contains(ps.key())) {
                 // Left the window while its batched BLAS build was in flight (window sync keeps running
                 // during builds). Never published — retire the fresh, unreferenced geometry.

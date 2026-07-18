@@ -74,6 +74,9 @@ public final class RtVideoOptions {
 			nameTags(),
 			blockOutline(),
 			waterWaves(),
+			localLights(),
+			localLightSamples(),
+			localLightRange(),
 		};
 	}
 
@@ -179,6 +182,32 @@ public final class RtVideoOptions {
 
 	private static OptionInstance<Boolean> waterWaves() {
 		return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
+	}
+
+	private static OptionInstance<Boolean> localLights() {
+		return bool("caustica.options.rt.localLights", CausticaConfig.Rt.LocalLights.ENABLED);
+	}
+
+	private static OptionInstance<Integer> localLightSamples() {
+		IntSetting setting = CausticaConfig.Rt.LocalLights.SAMPLES;
+		return new OptionInstance<>(
+			"caustica.options.rt.localLightSamples",
+			OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.localLightSamples.tooltip")),
+			(caption, value) -> Options.genericValueLabel(caption, Component.literal(Integer.toString(value))),
+			new OptionInstance.IntRange(1, 4),
+			Math.clamp(setting.value(), 1, 4),
+			setting::set);
+	}
+
+	private static OptionInstance<Integer> localLightRange() {
+		FloatSetting setting = CausticaConfig.Rt.LocalLights.RANGE;
+		return new OptionInstance<>(
+			"caustica.options.rt.localLightRange",
+			OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.localLightRange.tooltip")),
+			(caption, value) -> Options.genericValueLabel(caption, Component.literal(value + "")),
+			new OptionInstance.IntRange(4, 64),
+			Math.clamp(Math.round(setting.value()), 4, 64),
+			v -> setting.set((float) v));
 	}
 
 	private static OptionInstance<Boolean> dlssRrEnabled() {
@@ -299,8 +328,8 @@ public final class RtVideoOptions {
 			"caustica.options.rt.debugView",
 			OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.debugView.tooltip")),
 			(caption, value) -> Component.translatable("caustica.options.rt.debugView." + value),
-			new OptionInstance.Enum<>(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11), Codec.INT),
-			Math.clamp(setting.value(), 0, 11),
+			new OptionInstance.Enum<>(List.of(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13), Codec.INT),
+			Math.clamp(setting.value(), 0, 13),
 			setting::set);
 	}
 

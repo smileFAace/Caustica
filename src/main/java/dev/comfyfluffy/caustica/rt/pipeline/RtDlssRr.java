@@ -72,6 +72,14 @@ public final class RtDlssRr {
     }
 
     /**
+     * Drop temporal history on the next evaluate (camera cut, world change).
+     * Feature recreate already sets this; consumed once by {@link #evaluate}.
+     */
+    public void requestHistoryReset() {
+        resetHistory = true;
+    }
+
+    /**
      * Record a DLSS-RR evaluation: denoise + upscale the noisy path-traced color (at render res) using
      * the guide buffers, writing the display-res result into {@code out}. {@code jitterX/jitterY} is the
      * sub-pixel camera jitter applied to the primary ray this frame, in render pixels. Returns false

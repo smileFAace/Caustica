@@ -58,7 +58,7 @@ public final class CausticaConfig {
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
-            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Emission.STRENGTH, Rt.FrameStats.ENABLED,
+            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Emission.STRENGTH, Rt.LocalLights.ENABLED, Rt.FrameStats.ENABLED,
             Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -89,6 +89,10 @@ public final class CausticaConfig {
                 " Render-thread terrain work is bounded by dispatch/result counts per streaming pass.\n"
                         + " Buffer fill and BLAS/OMM preparation run on workers. max-inflight-sections bounds\n"
                         + " the complete snapshot -> worker -> GPU build -> publication lifecycle.");
+        FILE.setComment("local-lights",
+                " Explicit area-light NEE for block emitters (torches, glowstone, ...).\n"
+                        + " max-lights: per-frame GPU buffer capacity (closest/brightest kept).\n"
+                        + " samples: NEE samples per path vertex. range: soft falloff distance in blocks.");
         FILE.setComment("frame-generation",
                 " DLSS Frame Generation. Default off; gated additionally by hardware/driver availability.\n"
                         + " multi-frame-count: frames generated per rendered frame (1 = 2x, 2 = 3x, ...), clamped\n"
@@ -638,9 +642,31 @@ public final class CausticaConfig {
         public static final class DlssRr {
             public static final BooleanSetting ENABLED = bool("caustica.rt.dlssRr", "dlss-rr.enabled", true);
             public static final IntSetting PRESET = intValue("caustica.rt.dlssRr.preset", "dlss-rr.preset", 0);
-            public static final IntSetting QUALITY = intValue("caustica.rt.dlssRr.quality", "dlss-rr.quality", 0);
+            /** NGX quality: 0=Perf, 1=Balanced, 2=Quality, 3=UltraPerf, 5=DLAA. Default Quality for less blur. */
+            public static final IntSetting QUALITY = intValue("caustica.rt.dlssRr.quality", "dlss-rr.quality", 2);
 
             private DlssRr() {
+            }
+        }
+
+        /**
+         * Local block-light Next Event Estimation (simplified LightInfo path).
+         * Mesh-time quad extraction + per-frame global light buffer; sampled in the path tracer.
+         */
+        public static final class LocalLights {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.localLights", "local-lights.enabled", true);
+            /** Max area lights kept in the per-frame GPU buffer (closest / brightest first). */
+            public static final IntSetting MAX_LIGHTS =
+                    intAtLeast("caustica.rt.localLights.maxLights", "local-lights.max-lights", 256, 16);
+            /** How many independent NEE samples per path vertex (1 is cheap; 2–4 reduces variance). */
+            public static final IntSetting SAMPLES =
+                    clampedInt("caustica.rt.localLights.samples", "local-lights.samples", 1, 1, 4);
+            /** Soft range in blocks (falloff distance); larger = lights reach farther. */
+            public static final FloatSetting RANGE =
+                    clampedFloat("caustica.rt.localLights.range", "local-lights.range", 24.0f, 4.0f, 64.0f);
+
+            private LocalLights() {
             }
         }
 

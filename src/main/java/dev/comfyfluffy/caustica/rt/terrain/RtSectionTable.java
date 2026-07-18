@@ -203,11 +203,13 @@ final class RtSectionTable {
         final int sx;
         final int sy;
         final int sz;
+        /** Host-side local area lights (16 floats each), section-local; null if none. */
+        final float[] localLights;
         int slot = -1;
         int instanceIndex = -1;
 
         SectionGeom(long key, RtBuffer uvs, RtBuffer material,
-                    RtAccel blas, int[] triBase, int sx, int sy, int sz) {
+                    RtAccel blas, int[] triBase, int sx, int sy, int sz, float[] localLights) {
             this.key = key;
             this.uvs = uvs;
             this.material = material;
@@ -216,6 +218,7 @@ final class RtSectionTable {
             this.sx = sx;
             this.sy = sy;
             this.sz = sz;
+            this.localLights = localLights;
         }
 
         void destroy() {
