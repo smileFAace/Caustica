@@ -11,3 +11,5 @@ third_party/
 bin/
 .tools/
 .npm-cache/
+# Local clones for algorithm reference only (not vendored into the mod).
+docs/refs/
