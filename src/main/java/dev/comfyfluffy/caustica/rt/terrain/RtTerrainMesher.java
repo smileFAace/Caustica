@@ -9,6 +9,7 @@ import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
+import dev.comfyfluffy.caustica.rt.material.RtEmissionColorTable;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialAbi;
 import dev.comfyfluffy.caustica.rt.material.RtMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
@@ -46,6 +47,7 @@ import net.minecraft.core.SectionPos;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
@@ -445,6 +447,7 @@ final class RtTerrainMesher {
             q.tr = tr; q.tg = tg; q.tb = tb;
 
             q.emission = quad.emissive() ? 1f : (state != null ? state.getLightEmission() / 15f : 0f);
+            q.emissionTint = (q.emission > 0f && state != null) ? RtEmissionColorTable.packedFor(state) : 0;
             TextureAtlasSprite sprite = spriteFinder.find(quad);
             q.sprite = sprite;
             q.materialId = materials.resolve(sprite, state, q.translucent);
@@ -605,7 +608,8 @@ final class RtTerrainMesher {
                 prim.add(0f);
                 prim.add(Float.intBitsToFloat(q.materialId)); // TerrainPrim.materialId uint bits
                 prim.add(0f); // flags
-                prim.add(0f); // aux0
+                // aux0 = packed emission color temperature (0 = none); see RtEmissionColorTable.
+                prim.add(Float.intBitsToFloat(q.emissionTint));
                 prim.add(0f); // aux1
                 g.ommSprites.add(q.sprite);
             }
@@ -622,6 +626,7 @@ final class RtTerrainMesher {
         boolean tinted; // tintIndex >= 0 — the tinted member of a base+overlay pair
         float tr, tg, tb, emission;
         int materialId;
+        int emissionTint; // packed RGB for path-traced local lights (0 = none)
         TextureAtlasSprite sprite;
     }
 
@@ -741,6 +746,8 @@ final class RtTerrainMesher {
                 tg = sg / 1020f;
                 tb = sb / 1020f;
             }
+            int emissionTint = (!water && emission > 0f)
+                    ? RtEmissionColorTable.packedFor(Blocks.LAVA) : 0;
             FloatArrayList prim = g.prim;
             for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
                 prim.add(nx);
@@ -753,7 +760,7 @@ final class RtTerrainMesher {
                 prim.add(0f);
                 prim.add(Float.intBitsToFloat(materialId));
                 prim.add(0f);
-                prim.add(0f);
+                prim.add(Float.intBitsToFloat(emissionTint)); // aux0 emission color temperature
                 prim.add(0f);
                 g.ommSprites.add(null);
             }

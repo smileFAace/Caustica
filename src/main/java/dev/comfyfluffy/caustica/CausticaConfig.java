@@ -58,7 +58,7 @@ public final class CausticaConfig {
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
             Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
-            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.FrameStats.ENABLED,
+            Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Emission.STRENGTH, Rt.FrameStats.ENABLED,
             Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
@@ -100,6 +100,10 @@ public final class CausticaConfig {
                 " HDR display output (ST.2084/PQ). When enabled the swapchain is created in PQ automatically\n"
                         + " (falls back to SDR if the surface doesn't advertise it). paper-white-nits / peak-nits\n"
                         + " drive the scene-HDR -> display mapping.");
+        FILE.setComment("emission",
+                " Block-light emission scale (runtime, no geometry rebuild). strength multiplies path-traced\n"
+                        + " emitter hits at light-level 15; light-level-power shapes falloff of weaker lamps;\n"
+                        + " tint-strength blends the built-in per-block color-temperature table into albedo.");
     }
 
     private static Path resolveConfigPath() {
@@ -705,6 +709,26 @@ public final class CausticaConfig {
                     return "manual";
                 }
                 return "auto";
+            }
+        }
+
+        /**
+         * Path-traced block emission. All three knobs are re-read every frame via {@code WorldPush.emissionParams},
+         * so the Caustica settings UI can tune torch/glowstone appearance without rebuilding sections.
+         * Per-block color temperatures live in {@code RtEmissionColorTable} (geometry rebuild on table change).
+         */
+        public static final class Emission {
+            /** HDR scale at light level 15 (historical hard-coded value was 5.0). */
+            public static final FloatSetting STRENGTH =
+                    clampedFloat("caustica.rt.emission.strength", "emission.strength", 3.5f, 0.0f, 32.0f);
+            /** {@code pow(level01, power)} before strength. 1 = linear in light level; higher dims weaker lamps. */
+            public static final FloatSetting LIGHT_LEVEL_POWER =
+                    clampedFloat("caustica.rt.emission.lightLevelPower", "emission.light-level-power", 1.0f, 0.25f, 4.0f);
+            /** 0 = ignore color table (white), 1 = full per-block tint. */
+            public static final FloatSetting TINT_STRENGTH =
+                    clampedFloat("caustica.rt.emission.tintStrength", "emission.tint-strength", 1.0f, 0.0f, 1.0f);
+
+            private Emission() {
             }
         }
 

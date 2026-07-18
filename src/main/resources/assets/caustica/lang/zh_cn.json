@@ -1,5 +1,13 @@
 {
+	"caustica.options.screen.title": "Caustica 设置",
+	"caustica.options.screen.button": "Caustica...",
+
 	"caustica.options.rt.header": "光线追踪",
+	"caustica.options.rt.header.quality": "画质与显示",
+	"caustica.options.rt.header.emission": "方块光源",
+	"caustica.options.rt.header.features": "功能",
+	"caustica.options.rt.header.upscale": "超分与延迟",
+	"caustica.options.rt.header.debug": "调试",
 
 	"caustica.options.rt.exposureMode": "曝光",
 	"caustica.options.rt.exposureMode.tooltip": "决定如何将光线追踪图像映射到显示亮度。自动会适应场景亮度；手动会直接使用曝光值。",
@@ -27,6 +35,12 @@
 	"caustica.options.rt.glow": "实体发光轮廓",
 	"caustica.options.rt.glow.tooltip": "为发光实体绘制原版发光效果轮廓（可穿墙显示）。",
 
+	"caustica.options.rt.nameTags": "名牌",
+	"caustica.options.rt.nameTags.tooltip": "在光追叠加层绘制实体名牌。",
+
+	"caustica.options.rt.blockOutline": "方块轮廓",
+	"caustica.options.rt.blockOutline.tooltip": "用对 RT TLAS 的 ray query 绘制准星指向的方块轮廓。",
+
 	"caustica.options.rt.waterWaves": "动态水面",
 	"caustica.options.rt.waterWaves.tooltip": "对水面法线进行动画处理，以显示移动波浪高光。",
 
@@ -39,6 +53,9 @@
 	"caustica.options.rt.hdrPeak": "HDR 峰值亮度",
 	"caustica.options.rt.hdrPeak.tooltip": "高光回落目标的绝对亮度（nits）。请设为显示器的 HDR 峰值亮度。",
 
+	"caustica.options.rt.dlssRr": "DLSS 光线重建",
+	"caustica.options.rt.dlssRr.tooltip": "用 DLSS Ray Reconstruction 对路径追踪结果去噪并升频。关闭则退回线性 blit（噪声参考图）。",
+
 	"caustica.options.rt.dlssQuality": "DLSS 质量",
 	"caustica.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction 质量模式。较低质量模式会渲染更少像素并进行更激进的升频，以获得更高帧率；较高质量模式会渲染更多像素，以获得更清晰的图像。仅在启用 DLSS Ray Reconstruction 时影响画面。",
 	"caustica.options.rt.dlssQuality.3": "超高性能",
@@ -47,8 +64,30 @@
 	"caustica.options.rt.dlssQuality.2": "质量",
 	"caustica.options.rt.dlssQuality.5": "DLAA",
 
+	"caustica.options.rt.frameGeneration": "帧生成",
+	"caustica.options.rt.frameGeneration.tooltip": "DLSS Frame Generation（实验性）。需要受支持的 NVIDIA 硬件/驱动；在渲染帧之间插入生成帧。",
+
+	"caustica.options.rt.frameGenerationCount": "帧生成倍率",
+	"caustica.options.rt.frameGenerationCount.tooltip": "每渲染帧生成的额外帧数（1=2x，2=3x…）。运行时会钳制到驱动报告的上限。",
+
+	"caustica.options.rt.reflex": "NVIDIA Reflex",
+	"caustica.options.rt.reflex.tooltip": "低延迟调度（VK_NV_low_latency2）。需要设备支持；不支持时无效果。",
+
+	"caustica.options.rt.reflexBoost": "Reflex Boost",
+	"caustica.options.rt.reflexBoost.tooltip": "在开启 Reflex 时使用 low-latency boost。",
+
+	"caustica.options.rt.frameStats": "帧统计",
+	"caustica.options.rt.frameStats.tooltip": "记录 RT 各阶段耗时（游戏目录下 CSV）。仅用于性能分析。",
+
+	"caustica.options.rt.emissionStrength": "发光强度",
+	"caustica.options.rt.emissionStrength.tooltip": "光级 15 时方块灯的 HDR 缩放。越大火把/萤石越亮；过大容易洗成惨白。",
+	"caustica.options.rt.emissionLightLevelPower": "光级曲线",
+	"caustica.options.rt.emissionLightLevelPower.tooltip": "强度前对光级做 pow(level, power)。1.0 为线性；越大则弱灯相对 15 级光源更暗。",
+	"caustica.options.rt.emissionTintStrength": "发光色温",
+	"caustica.options.rt.emissionTintStrength.tooltip": "内置方块色温表混入力度（火把橙、萤石黄、末地烛冷白）。0% 只跟贴图 albedo。",
+
 	"caustica.options.rt.debugView": "调试视图",
-	"caustica.options.rt.debugView.tooltip": "显示光线追踪的中间缓冲区，而不是最终图像。",
+	"caustica.options.rt.debugView.tooltip": "显示光线追踪的中间缓冲区，而不是最终图像。调方块灯时用发光相关视图。",
 	"caustica.options.rt.debugView.0": "关闭",
 	"caustica.options.rt.debugView.1": "法线",
 	"caustica.options.rt.debugView.2": "反照率",
@@ -56,5 +95,9 @@
 	"caustica.options.rt.debugView.4": "粗糙度",
 	"caustica.options.rt.debugView.5": "运动",
 	"caustica.options.rt.debugView.6": "高光",
-	"caustica.options.rt.debugView.7": "高光运动"
+	"caustica.options.rt.debugView.7": "高光运动",
+	"caustica.options.rt.debugView.8": "发光遮罩",
+	"caustica.options.rt.debugView.9": "发光来源",
+	"caustica.options.rt.debugView.10": "发光颜色",
+	"caustica.options.rt.debugView.11": "发光贡献"
 }

@@ -17,6 +17,7 @@
 		"MinecraftReloadMixin",
 		"ModelPartAccessor",
 		"OptionsMixin",
+		"OptionsScreenMixin",
 		"OptionsSubScreenAccessor",
 		"ParticleEngineAccessor",
 		"RenderSetupAccessor",

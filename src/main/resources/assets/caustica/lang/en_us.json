@@ -1,5 +1,13 @@
 {
+	"caustica.options.screen.title": "Caustica Settings",
+	"caustica.options.screen.button": "Caustica...",
+
 	"caustica.options.rt.header": "Ray Tracing",
+	"caustica.options.rt.header.quality": "Quality & Display",
+	"caustica.options.rt.header.emission": "Block Lights",
+	"caustica.options.rt.header.features": "Features",
+	"caustica.options.rt.header.upscale": "Upscale & Latency",
+	"caustica.options.rt.header.debug": "Debug",
 
 	"caustica.options.rt.exposureMode": "Exposure",
 	"caustica.options.rt.exposureMode.tooltip": "How the ray-traced image is mapped to display brightness. Auto adapts to scene luminance; Manual uses the exposure value directly.",
@@ -27,6 +35,12 @@
 	"caustica.options.rt.glow": "Entity Glow Outline",
 	"caustica.options.rt.glow.tooltip": "Draw the vanilla Glowing-effect outline (through walls) around glowing entities.",
 
+	"caustica.options.rt.nameTags": "Name Tags",
+	"caustica.options.rt.nameTags.tooltip": "Draw entity name tags in the RT overlay path.",
+
+	"caustica.options.rt.blockOutline": "Block Outline",
+	"caustica.options.rt.blockOutline.tooltip": "Draw the looking-at block outline using a ray query against the RT TLAS.",
+
 	"caustica.options.rt.waterWaves": "Animated Water",
 	"caustica.options.rt.waterWaves.tooltip": "Animate water-surface normals for moving wave highlights.",
 
@@ -39,6 +53,9 @@
 	"caustica.options.rt.hdrPeak": "HDR Peak Brightness",
 	"caustica.options.rt.hdrPeak.tooltip": "Absolute brightness (in nits) highlights roll off toward. Set to your display's peak HDR brightness.",
 
+	"caustica.options.rt.dlssRr": "DLSS Ray Reconstruction",
+	"caustica.options.rt.dlssRr.tooltip": "Denoise and upscale the path-traced image with DLSS Ray Reconstruction. Off falls back to a linear blit (noisy reference).",
+
 	"caustica.options.rt.dlssQuality": "DLSS Quality",
 	"caustica.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction quality mode. Lower-quality modes render fewer pixels and upscale more aggressively for higher framerates; higher-quality modes render more pixels for a sharper image. Only affects the image when DLSS Ray Reconstruction is enabled.",
 	"caustica.options.rt.dlssQuality.3": "Ultra Performance",
@@ -47,8 +64,30 @@
 	"caustica.options.rt.dlssQuality.2": "Quality",
 	"caustica.options.rt.dlssQuality.5": "DLAA",
 
+	"caustica.options.rt.frameGeneration": "Frame Generation",
+	"caustica.options.rt.frameGeneration.tooltip": "DLSS Frame Generation (experimental). Needs supported NVIDIA hardware/driver; generates extra frames between rendered frames.",
+
+	"caustica.options.rt.frameGenerationCount": "FG Multi-Frame",
+	"caustica.options.rt.frameGenerationCount.tooltip": "Generated frames per rendered frame (1=2x, 2=3x, …). Clamped at runtime to the driver's MultiFrameCountMax.",
+
+	"caustica.options.rt.reflex": "NVIDIA Reflex",
+	"caustica.options.rt.reflex.tooltip": "Low-latency pacing (VK_NV_low_latency2). Requires device support; no-op on unsupported GPUs.",
+
+	"caustica.options.rt.reflexBoost": "Reflex Boost",
+	"caustica.options.rt.reflexBoost.tooltip": "Reflex low-latency boost mode when Reflex is enabled.",
+
+	"caustica.options.rt.frameStats": "Frame Stats",
+	"caustica.options.rt.frameStats.tooltip": "Log per-stage RT frame timings (CSV under the game directory). For profiling only.",
+
+	"caustica.options.rt.emissionStrength": "Emission Strength",
+	"caustica.options.rt.emissionStrength.tooltip": "HDR scale of block lights at light level 15. Higher makes torches and glowstone brighter; too high washes them out white.",
+	"caustica.options.rt.emissionLightLevelPower": "Light Level Curve",
+	"caustica.options.rt.emissionLightLevelPower.tooltip": "pow(level, power) before strength. 1.0 is linear in light level; higher values dim weaker lamps relative to level-15 sources.",
+	"caustica.options.rt.emissionTintStrength": "Emission Color Tint",
+	"caustica.options.rt.emissionTintStrength.tooltip": "How strongly the built-in per-block color table tints emissive surfaces (torch orange, glowstone yellow, end rod cool white). 0% = albedo only.",
+
 	"caustica.options.rt.debugView": "Debug View",
-	"caustica.options.rt.debugView.tooltip": "Visualize an intermediate ray-tracing buffer instead of the final image.",
+	"caustica.options.rt.debugView.tooltip": "Visualize an intermediate ray-tracing buffer instead of the final image. Use Emission views when tuning block lights.",
 	"caustica.options.rt.debugView.0": "Off",
 	"caustica.options.rt.debugView.1": "Normals",
 	"caustica.options.rt.debugView.2": "Albedo",
@@ -58,5 +97,7 @@
 	"caustica.options.rt.debugView.6": "Specular",
 	"caustica.options.rt.debugView.7": "Specular Motion",
 	"caustica.options.rt.debugView.8": "Emission Mask",
-	"caustica.options.rt.debugView.9": "Emission Source"
+	"caustica.options.rt.debugView.9": "Emission Source",
+	"caustica.options.rt.debugView.10": "Emission Color",
+	"caustica.options.rt.debugView.11": "Emission Lit"
 }

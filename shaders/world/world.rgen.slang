@@ -84,7 +84,7 @@ static const float INV_PI = 0.31830988618;
 // The analytic sky (gradient + sun/moon discs + stars) is computed in world.rmiss. On a miss, raygen
 // reads payload.albedo and accumulates that sky radiance. The directional NEE light is pushed separately
 // as worldPush.lightDir / worldPush.lightRadiance / worldPush.sunDir.
-static const float EMISSIVE_STRENGTH = 5.0; // HDR radiance of a full (level-15) emitter, modulated by albedo
+// Block emission scale lives in worldPush.emissionParams (runtime-tunable); no hard-coded strength here.
 static const float SURF_BIAS = 0.005;  // offset secondary-ray origins along the normal (anti-acne)
 static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset already clears the surface
 
@@ -773,13 +773,18 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
             gv_motionObjDisp = payload.motionPrev; // per-vertex world motion (0 for static terrain/sky)
         }
 
-        // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly, colored by albedo.
+        // Emissive surfaces (lava, glowstone, torches, ...) add radiance directly.
+        // Color comes from hit albedo (already multiplied by optional per-prim emission tint in rchit).
+        // Scale = pow(level01, lightLevelPower) * emissiveStrength from worldPush.emissionParams (runtime).
         // Block lights have no NEE, so emission is gathered by hitting emitters during the walk (counted
         // at every vertex, no double counting). Small emitters are noisy, but temporal accumulation
         // converges static views.
         float emission = payloadEmission();
         if (emission > 0.0) {
-            L += throughput * albedo * emission * EMISSIVE_STRENGTH;
+            float strength = max(worldPush.emissionParams.x, 0.0);
+            float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
+            float level = pow(saturate(emission), levelPower);
+            L += throughput * albedo * level * strength;
         }
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night) — Lambert
@@ -976,6 +981,17 @@ void main() {
                     : float3(0.0, 0.0, 0.0);
             dbg = sourceColor * (gv_emissionSource == EMISSION_SOURCE_NONE
                     ? 0.0 : max(0.2, clamp(gv_emission, 0.0, 1.0)));
+        } else if (pc.debugView == 10u) {
+            // Emission contribution proxy: albedo * level (before global strength), for color-temperature tuning.
+            float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
+            float level = pow(saturate(gv_emission), levelPower);
+            dbg = gv_albedo * level;
+        } else if (pc.debugView == 11u) {
+            // Full emission term scale including runtime strength (clamped for visibility).
+            float strength = max(worldPush.emissionParams.x, 0.0);
+            float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
+            float level = pow(saturate(gv_emission), levelPower);
+            dbg = saturate(gv_albedo * level * strength * 0.15);
         } else {
             dbg = float3(clamp(0.5 + motion * 0.05, 0.0, 1.0), 0.5); // motion: red=+x, green=+y
         }

@@ -410,6 +410,14 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             materialHeader.params.x, materialHeader.params.y, emission, nonSolid);
     n = surface.normal;
     payload.albedo *= surface.ao;
+    // Optional per-prim emission color temperature (aux0) + runtime tintStrength from WorldPush.
+    // Applied to albedo so path-traced emission (albedo * level * strength) picks up torch-orange etc.
+    if (surface.emission > 0.0 && pr.aux0 != 0u) {
+        ConstPtr<WorldPush> worldPush = ConstPtr<WorldPush>(pc.worldPushAddr);
+        float tintStrength = saturate(worldPush.emissionParams.z);
+        float3 eTint = unpackEmissionTint(pr.aux0);
+        payload.albedo *= lerp(float3(1.0, 1.0, 1.0), eTint, tintStrength);
+    }
     // Block-breaking overlay: opaque/cutout terrain (water skips — fluids aren't breakable). Evaluate
     // it after normal mapping so decal projection uses the same shading orientation as the old path.
     if (material != MATERIAL_WATER) {

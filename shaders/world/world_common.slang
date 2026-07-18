@@ -50,6 +50,12 @@ public struct WorldPush {
     public float4   waterParams;      // xyz camera-biome water tint, w wave time (s)
     public float4   waterAnchor;      // xy world-stable wave-domain anchor
     public float4x4 curViewProj;      // forward camera-relative view-projection
+    // Runtime block-emission controls (tunable without shader rebuild of geometry):
+    // x = emissiveStrength (HDR scale at light level 15),
+    // y = lightLevelPower (pow(level01, y) before strength),
+    // z = tintStrength (0 = ignore per-prim emission tint, 1 = full),
+    // w = reserved.
+    public float4   emissionParams;
     public uint     breakCount;
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
 };
@@ -170,6 +176,18 @@ public uint packHalf2(float2 v) {
 
 public float2 unpackHalf2(uint p) {
     return float2(f16tof32(p & 0xFFFFu), f16tof32(p >> 16));
+}
+
+// Per-prim emission color temperature packed into TerrainPrim/Prim.aux0 as 8-bit RGB in the low 24 bits
+// (0 = no override / white). Written by the Java mesher from RtEmissionColorTable.
+public float3 unpackEmissionTint(uint packed) {
+    if (packed == 0u) {
+        return float3(1.0, 1.0, 1.0);
+    }
+    return float3(
+            float((packed >> 16) & 0xFFu) / 255.0,
+            float((packed >> 8) & 0xFFu) / 255.0,
+            float(packed & 0xFFu) / 255.0);
 }
 
 // Vanilla's block/entity atlases are ordinary sRGB-encoded PNGs sampled through a plain UNORM view (no

@@ -858,6 +858,11 @@ public final class RtComposite {
                     waterParams,
                     waterAnchor,
                     mvCurProjView,
+                    new Float4(
+                            CausticaConfig.Rt.Emission.STRENGTH.value(),
+                            CausticaConfig.Rt.Emission.LIGHT_LEVEL_POWER.value(),
+                            CausticaConfig.Rt.Emission.TINT_STRENGTH.value(),
+                            0f),
                     breaking.length,
                     breaking
             ).write(push);
