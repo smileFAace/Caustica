@@ -422,9 +422,10 @@ float3 visibility(float3 origin, float3 dir, float tmax) {
     return hObj.IsMiss() ? shadowVis.rgb : float3(0.0, 0.0, 0.0);
 }
 
-// --- Local block-light NEE (simplified LightInfo path) ---------------------------------------------
-// Uniform pick among worldPush.localLightCount area lights; sample a point on the triangle; soft range
-// falloff; one shadow ray. No full ReSTIR — variance drops vs hit-only emission for nearby torches.
+// --- Local block-light NEE (point lights, one per emissive block) ----------------------------------
+// Weighted pick among nearby lights (weight in radiance.w). Soft inverse-square + range window.
+// Contribution is clamped so a single lucky close sample cannot firefly the frame.
+// Hit emission still paints the lamp face; NEE only lights *receivers*.
 
 float3 sampleLocalLightNEE(float3 p, float3 n, float3 v, float3 diffAlb, float3 F0, float rough,
                            bool pbr, inout uint seed) {
@@ -435,61 +436,68 @@ float3 sampleLocalLightNEE(float3 p, float3 n, float3 v, float3 diffAlb, float3 
     ConstPtr<LocalLight> lights = ConstPtr<LocalLight>(worldPush.localLightsAddr);
     uint samples = max(worldPush.localLightSamples, 1u);
     float range = max(worldPush.localLightRange, 1.0);
-    float rangeSq = range * range;
     float strength = max(worldPush.emissionParams.x, 0.0);
     float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
     float3 sum = float3(0.0, 0.0, 0.0);
 
+    // Two-pass over a tiny list is fine (N <= 256): build total weight, then weighted pick.
+    // For N samples we re-roll each time (no reservoir) — list is short after CPU cull.
+    float totalW = 0.0;
+    for (uint i = 0u; i < lightCount; i++) {
+        totalW += max(lights[i].radiance.w, 0.0);
+    }
+    if (totalW <= 1.0e-8) {
+        return float3(0.0, 0.0, 0.0);
+    }
+
+    // Analytic-ish point-light scale so torch-level emitters fill ~range like vanilla light levels,
+    // without area * N explosions from the earlier triangle formulation.
+    const float POINT_SCALE = 4.0;
+    // Hard cap on one sample's HDR contribution (before throughput) to kill fireflies.
+    const float MAX_CONTRIB = 8.0;
+
     for (uint s = 0u; s < samples; s++) {
-        uint li = min(uint(floor(rndf(seed) * float(lightCount))), lightCount - 1u);
+        float r = rndf(seed) * totalW;
+        uint li = 0u;
+        float acc = 0.0;
+        for (uint i = 0u; i < lightCount; i++) {
+            acc += max(lights[i].radiance.w, 0.0);
+            if (r <= acc) {
+                li = i;
+                break;
+            }
+            li = i;
+        }
         LocalLight light = lights[li];
-        float area = light.radiance.w;
-        if (area <= 1.0e-8) {
-            continue;
-        }
-        // Uniform barycentric sample on the triangle.
-        float r1 = rndf(seed);
-        float r2 = rndf(seed);
-        float su = 1.0 - sqrt(r1);
-        float sv = r2 * sqrt(r1);
-        float sw = 1.0 - su - sv;
-        float3 lightPos = light.p0.xyz * sw + light.p1.xyz * su + light.p2.xyz * sv;
+        float w = max(light.radiance.w, 1.0e-4);
+        float3 lightPos = light.position.xyz;
+        // Jitter inside the block so hard shadow edges soften a bit under RR.
+        lightPos += (float3(rndf(seed), rndf(seed), rndf(seed)) - 0.5) * 0.35;
+
         float3 toLight = lightPos - p;
-        float distSq = dot(toLight, toLight);
-        if (distSq < 1.0e-8 || distSq > rangeSq * 4.0) {
+        float distSq = max(dot(toLight, toLight), 0.04); // avoid 1/r² singularity at contact
+        float dist = sqrt(distSq);
+        if (dist > range) {
             continue;
         }
-        float dist = sqrt(distSq);
         float3 ldir = toLight / dist;
         float ndl = max(0.0, dot(n, ldir));
         if (ndl <= 0.0) {
             continue;
         }
-        // Light normal from triangle (for one-sided emitters).
-        float3 ln = cross(light.p1.xyz - light.p0.xyz, light.p2.xyz - light.p0.xyz);
-        float lnLen = length(ln);
-        if (lnLen <= 1.0e-8) {
-            continue;
-        }
-        ln /= lnLen;
-        float lightNdl = max(0.0, dot(ln, -ldir)); // receiver must see the front face
-        if (lightNdl <= 0.0) {
-            continue;
-        }
-        float3 vis = visibility(p, ldir, dist - 1.0e-3);
+        float3 vis = visibility(p, ldir, dist * 0.99);
         if (max(vis.r, max(vis.g, vis.b)) <= 0.0) {
             continue;
         }
-        // Soft falloff beyond `range` (still allows a little overshoot from hard cull at 2*range).
+
         float atten = saturate(1.0 - dist / range);
-        atten *= atten;
-        // light.radiance.xyz already holds level * tint (0..~1). Apply runtime strength + power curve.
-        float level = pow(saturate(max(light.radiance.x, max(light.radiance.y, light.radiance.z))), levelPower);
-        // Use chromaticity of stored radiance, magnitude from level*strength.
-        float3 tint = light.radiance.xyz / max(max(light.radiance.x, max(light.radiance.y, light.radiance.z)), 1.0e-4);
+        atten *= atten; // smooth window * 1/r² below
+
+        float peak = max(light.radiance.x, max(light.radiance.y, light.radiance.z));
+        float level = pow(saturate(peak), levelPower);
+        float3 tint = light.radiance.xyz / max(peak, 1.0e-4);
         float3 Le = tint * level * strength;
-        // Area-measure sample: pdf = (1/N) * (1/area). Solid-angle factor = cos_light / r².
-        // L += f * Le * cos_surf * cos_light * area * N / r²
+
         float3 brdf = diffAlb * INV_PI;
         if (pbr) {
             float3 h = normalize(ldir + v);
@@ -501,7 +509,16 @@ float3 sampleLocalLightNEE(float3 p, float3 n, float3 v, float3 diffAlb, float3 
             float3 F = fresnelSchlick(vdh, F0);
             brdf += (D * G) * F / (4.0 * ndv * ndl);
         }
-        sum += brdf * Le * ndl * lightNdl * area * float(lightCount) / distSq * atten * vis;
+
+        // pdf_pick = w / totalW. Estimate = f * Le * cos * POINT_SCALE * atten / r² / pdf_pick.
+        float pdfPick = w / totalW;
+        float3 contrib = brdf * Le * ndl * POINT_SCALE * atten / distSq / max(pdfPick, 1.0e-6) * vis;
+        // Firefly clamp (luminance).
+        float lum = dot(contrib, float3(0.2126, 0.7152, 0.0722));
+        if (lum > MAX_CONTRIB) {
+            contrib *= MAX_CONTRIB / lum;
+        }
+        sum += contrib;
     }
     return sum / float(samples);
 }
@@ -857,15 +874,11 @@ float3 tracePath(float3 ro, float3 rd, float primaryConeSpread, inout uint seed)
             gv_motionObjDisp = payload.motionPrev; // per-vertex world motion (0 for static terrain/sky)
         }
 
-        // Emissive surfaces (lava, glowstone, torches, ...) add radiance on hit.
-        // Color comes from hit albedo (already multiplied by optional per-prim emission tint in rchit).
-        // Scale = pow(level01, lightLevelPower) * emissiveStrength from worldPush.emissionParams (runtime).
-        // When local-light NEE is active, only count hit emission on the primary bounce so the lamp face
-        // stays bright without double-counting NEE already lighting nearby surfaces. Without NEE, keep
-        // the legacy every-vertex gather (noisy but unbiased for that path).
+        // Emissive surfaces (lava, glowstone, torches, ...) add radiance on hit — paints the lamp face
+        // and any bounce that lands on an emitter. Local NEE (below) lights *other* surfaces toward
+        // those emitters; the two paths serve different roles so both stay on at every bounce.
         float emission = payloadEmission();
-        bool localNee = worldPush.localLightCount > 0u;
-        if (emission > 0.0 && (!localNee || bounce == 0)) {
+        if (emission > 0.0) {
             float strength = max(worldPush.emissionParams.x, 0.0);
             float levelPower = max(worldPush.emissionParams.y, 1.0e-3);
             float level = pow(saturate(emission), levelPower);

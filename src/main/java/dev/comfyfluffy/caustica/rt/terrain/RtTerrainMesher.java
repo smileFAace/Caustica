@@ -189,6 +189,10 @@ final class RtTerrainMesher {
                         // so the path tracer can branch (see emitQuad).
                         fluidCapture.water = fluid.is(FluidTags.WATER);
                         RtFluidMesher.tesselate(region, m, fluidCapture, fluidRenderer.fluidModels, state, fluid);
+                        if (!fluidCapture.water && fluidCapture.emission > 1.0e-4f) {
+                            mesh.addBlockLight(lx, ly, lz, fluidCapture.emission,
+                                    RtEmissionColorTable.packedFor(Blocks.LAVA));
+                        }
                     }
                     if (state.getRenderShape() != RenderShape.MODEL) {
                         continue;
@@ -206,6 +210,16 @@ final class RtTerrainMesher {
                     blockRandom.setSeed(state.getSeed(m));
                     model.emitQuads(blockEmitter, region, m, state, blockRandom, capture.cullTest);
                     capture.flushBlock(); // resolve coplanar ties (grass overlay / cross faces), then emit
+                    // One NEE point light per emissive block (not per quad) — stable short list.
+                    float blockEmission = state.getLightEmission() / 15f;
+                    if (blockEmission <= 1.0e-4f && capture.lastBlockWasEmissiveQuad) {
+                        blockEmission = 1f; // resource-pack emissive without light level
+                    }
+                    if (blockEmission > 1.0e-4f) {
+                        int tint = RtEmissionColorTable.packedFor(state);
+                        mesh.addBlockLight(lx, ly, lz, blockEmission, tint);
+                    }
+                    capture.lastBlockWasEmissiveQuad = false;
                 }
             }
         }
@@ -236,8 +250,8 @@ final class RtTerrainMesher {
         private static final int CUTOUT_TRI_CAP = 256;
         private static final int TRANSLUCENT_TRI_CAP = 64;
         private static final int WATER_TRI_CAP = 128;
-        /** Cap lights extracted per section (mesh-time); frame path culls further. */
-        private static final int MAX_SECTION_LIGHTS = 64;
+        /** Cap lights extracted per section (one per emissive block); frame path culls further. */
+        private static final int MAX_SECTION_LIGHTS = 96;
         // One bucket per fixed RtAccel terrain geometry: solid, cutout, translucent, water.
         private static final Geom EMPTY_GEOM = new Geom(0);
         Geom opaque;
@@ -245,8 +259,10 @@ final class RtTerrainMesher {
         Geom translucent;
         Geom water;
         private final Geom[] buckets = new Geom[RtAccel.TERRAIN_BUCKETS];
-        /** Host-side area lights: 16 floats each (p0,p1,p2,radiance+area), section-local. */
-        private final FloatArrayList localLights = new FloatArrayList(16 * 8);
+        /** Host-side point lights: 16 floats each (pos + radiance + weight), section-local. */
+        private final FloatArrayList localLights = new FloatArrayList(16 * 16);
+        /** Packed section-local block keys already emitted as lights (dedupe multi-quad emitters). */
+        private final LongOpenHashSet localLightBlocks = new LongOpenHashSet(16);
 
         Geom[] buckets() {
             buckets[RtAccel.BUCKET_SOLID] = geomOrEmpty(opaque);
@@ -294,6 +310,7 @@ final class RtTerrainMesher {
             resetGeom(translucent);
             resetGeom(water);
             localLights.clear();
+            localLightBlocks.clear();
         }
 
         private static void resetGeom(Geom geom) {
@@ -309,45 +326,35 @@ final class RtTerrainMesher {
             return localLights.toFloatArray();
         }
 
-        /** Record one emissive triangle as an explicit NEE area light (section-local positions). */
-        void addLocalLight(float p0x, float p0y, float p0z,
-                           float p1x, float p1y, float p1z,
-                           float p2x, float p2y, float p2z,
-                           float nx, float ny, float nz,
-                           float emission, int emissionTint) {
-            if (localLights.size() / RtLocalLights.UPLOAD_FLOATS >= MAX_SECTION_LIGHTS) {
-                return;
-            }
+        /**
+         * One point light per emissive block (section-local center). Multi-quad models (torches) only
+         * register once — keeps the NEE list short and avoids over-bright multi-sample explosions.
+         */
+        void addBlockLight(int lx, int ly, int lz, float emission, int emissionTint) {
             if (emission <= 1.0e-4f) {
                 return;
             }
-            // Triangle area via cross product.
-            float e1x = p1x - p0x, e1y = p1y - p0y, e1z = p1z - p0z;
-            float e2x = p2x - p0x, e2y = p2y - p0y, e2z = p2z - p0z;
-            float cx = e1y * e2z - e1z * e2y;
-            float cy = e1z * e2x - e1x * e2z;
-            float cz = e1x * e2y - e1y * e2x;
-            float area = 0.5f * (float) Math.sqrt(cx * cx + cy * cy + cz * cz);
-            if (area <= 1.0e-6f) {
+            if (localLights.size() / RtLocalLights.UPLOAD_FLOATS >= MAX_SECTION_LIGHTS) {
                 return;
             }
-            // Radiance proxy: emission level * optional color temperature (matches hit-emission scale
-            // before WorldPush strength; shader multiplies strength again for NEE).
+            long key = (((long) lx & 0xFFL) << 16) | (((long) ly & 0xFFL) << 8) | ((long) lz & 0xFFL);
+            if (!localLightBlocks.add(key)) {
+                return;
+            }
             float tr = 1f, tg = 1f, tb = 1f;
             if (emissionTint != 0) {
                 tr = ((emissionTint >> 16) & 0xFF) / 255f;
                 tg = ((emissionTint >> 8) & 0xFF) / 255f;
                 tb = (emissionTint & 0xFF) / 255f;
             }
-            // Bias slightly along normal so shadow rays from receivers don't self-hit the emitter face.
-            float bias = 0.002f;
-            p0x += nx * bias; p0y += ny * bias; p0z += nz * bias;
-            p1x += nx * bias; p1y += ny * bias; p1z += nz * bias;
-            p2x += nx * bias; p2y += ny * bias; p2z += nz * bias;
+            // Center of the block in section-local space (matches instance origin + block offset).
+            float cx = lx + 0.5f;
+            float cy = ly + 0.5f;
+            float cz = lz + 0.5f;
+            float weight = emission * Math.max(tr, Math.max(tg, tb));
             float[] scratch = new float[RtLocalLights.UPLOAD_FLOATS];
-            RtLocalLights.writeLight(scratch, 0,
-                    p0x, p0y, p0z, p1x, p1y, p1z, p2x, p2y, p2z,
-                    tr * emission, tg * emission, tb * emission, area);
+            RtLocalLights.writePointLight(scratch, 0, cx, cy, cz,
+                    tr * emission, tg * emission, tb * emission, weight);
             for (float v : scratch) {
                 localLights.add(v);
             }
@@ -440,6 +447,8 @@ final class RtTerrainMesher {
         BlockState state;
         BlockPos pos;
         float originX, originY, originZ;
+        /** Set if any quad this block reported emissive (for packs that skip light level). */
+        boolean lastBlockWasEmissiveQuad;
         private final BlockPos.MutableBlockPos cullPos = new BlockPos.MutableBlockPos();
         private final java.util.function.Predicate<Direction> cullTest = this::isCulled;
 
@@ -504,6 +513,9 @@ final class RtTerrainMesher {
             q.tr = tr; q.tg = tg; q.tb = tb;
 
             q.emission = quad.emissive() ? 1f : (state != null ? state.getLightEmission() / 15f : 0f);
+            if (q.emission > 1.0e-4f) {
+                lastBlockWasEmissiveQuad = true;
+            }
             q.emissionTint = (q.emission > 0f && state != null) ? RtEmissionColorTable.packedFor(state) : 0;
             TextureAtlasSprite sprite = spriteFinder.find(quad);
             q.sprite = sprite;
@@ -670,15 +682,6 @@ final class RtTerrainMesher {
                 prim.add(0f); // aux1
                 g.ommSprites.add(q.sprite);
             }
-            // Explicit area lights for local NEE (one triangle of the quad is enough; second is coplanar).
-            if (q.emission > 1.0e-4f) {
-                cur.addLocalLight(
-                        q.x[0], q.y[0], q.z[0],
-                        q.x[1], q.y[1], q.z[1],
-                        q.x[2], q.y[2], q.z[2],
-                        q.nx, q.ny, q.nz,
-                        q.emission, q.emissionTint);
-            }
         }
     }
 
@@ -829,10 +832,6 @@ final class RtTerrainMesher {
                 prim.add(Float.intBitsToFloat(emissionTint)); // aux0 emission color temperature
                 prim.add(0f);
                 g.ommSprites.add(null);
-            }
-            if (!water && emission > 1.0e-4f) {
-                cur.addLocalLight(qx[0], qy[0], qz[0], qx[1], qy[1], qz[1], qx[2], qy[2], qz[2],
-                        nx, ny, nz, emission, emissionTint);
             }
         }
 

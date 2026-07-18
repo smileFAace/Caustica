@@ -66,12 +66,13 @@ public struct WorldPush {
     public BreakEntry breaking[8];    // Java capacity and breakCount serialization are generated from this
 };
 
-// One area light triangle for local NEE. 64 B std430 (4 x float4).
+// One block point light for local NEE. 64 B std430 (4 x float4).
+// One entry per emissive block (not per mesh triangle) to keep the list short and sampling stable.
 public struct LocalLight {
-    public float4 p0;       // xyz position (terrain-rebase), w unused
-    public float4 p1;
-    public float4 p2;
-    public float4 radiance; // xyz radiance proxy (level * tint), w = area
+    public float4 position; // xyz terrain-rebase center of the emitter block, w unused
+    public float4 radiance; // xyz = tint * level01, w = relative pick weight
+    public float4 pad0;
+    public float4 pad1;
 };
 
 // Radiance-ray payload (location 0). Member order and types are a cross-stage ABI.
